@@ -26,5 +26,7 @@ run_case() {
 run_case sample.ts typescript expected_sample.txt
 run_case staticAssetContentType.ts typescript expected_staticAssetContentType.txt
 run_case CliBackendIcon.tsx tsx expected_CliBackendIcon.txt
+run_case topicTranscriptStore.ts typescript expected_topicTranscriptStore.txt
+run_case GatewayStatsPanel.tsx tsx expected_GatewayStatsPanel.txt
 [ $fail -eq 0 ] && echo "ACCEPTANCE: ALL PASS" || echo "ACCEPTANCE: FAILURES"
 exit $fail
