@@ -1,7 +1,7 @@
 // EXPECT: SLARS-DERIVE-UNSUPPORTED
 #[derive(Clone)]
 struct Bag {
-    x: i32,
+    r: &i32,
 }
 
 fn main() -> i32 {

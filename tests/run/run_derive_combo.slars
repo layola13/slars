@@ -1,0 +1,17 @@
+#[derive(Clone, Debug, PartialEq)]
+struct Combo {
+    x: i32,
+}
+
+impl Combo {
+    fn get(&self) -> i32 {
+        return self.x;
+    }
+}
+
+fn main() -> i32 {
+    let c = Combo { x: 4 };
+    let d = c.clone();
+    println!("{}", c.get() + d.get());
+    return 0;
+}

@@ -1,0 +1,7 @@
+// EXPECT: SLARS-LOOP-VALUE
+fn main() -> i32 {
+    let x = loop {
+        break 5;
+    };
+    return x;
+}

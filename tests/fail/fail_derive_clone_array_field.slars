@@ -1,0 +1,9 @@
+// EXPECT: SLARS-DERIVE-UNSUPPORTED
+#[derive(Clone)]
+struct Bag {
+    arr: [i32; 3],
+}
+
+fn main() -> i32 {
+    return 0;
+}

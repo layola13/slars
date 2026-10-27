@@ -1,0 +1,9 @@
+// EXPECT: SLARS-LOOP-VALUE
+fn main() -> i32 {
+    let mut i = 0;
+    loop {
+        i = i + 1;
+        if i > 2 { break 5; };
+    }
+    return i;
+}

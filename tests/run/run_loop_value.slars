@@ -1,0 +1,29 @@
+fn pick() -> i32 {
+    let mut i = 0;
+    return loop {
+        i = i + 1;
+        if i >= 3 { break i * 10; };
+    };
+}
+
+fn main() -> i32 {
+    let a: i32 = loop {
+        break 7;
+    };
+    let mut b = 0;
+    let mut j = 0;
+    b = loop {
+        j = j + 1;
+        if j >= 4 { break j + a; };
+    };
+    let c: i32 = loop {
+        let mut k = 0;
+        loop {
+            k = k + 1;
+            if k >= 2 { break; };
+        }
+        break k * 100 + pick();
+    };
+    println!("{}", a + b + c);
+    return 0;
+}

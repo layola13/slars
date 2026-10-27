@@ -1,0 +1,46 @@
+#[derive(Default)]
+struct Inner {
+    x: i32,
+}
+
+#[derive(Default)]
+enum Mode {
+    Off,
+    #[default]
+    On(i32),
+}
+
+#[derive(Default)]
+struct Forms {
+    n: i32,
+    f: f64,
+    ok: bool,
+    ch: char,
+    name: String,
+    items: Vec<i32>,
+    maybe: Option<i32>,
+    arr: [i32; 3],
+    pair: (i32, bool),
+    inner: Inner,
+    mode: Mode,
+}
+
+fn main() -> i32 {
+    let d = Forms::default();
+    if d.n != 0 { return 1; };
+    if d.ok { return 2; };
+    if len(d.name) != 0 { return 3; };
+    if len(d.items) != 0 { return 4; };
+    let mv = match d.maybe { Option::Some(v) => { v }, Option::None => { 7 }, };
+    if mv != 7 { return 5; };
+    if d.arr[0] + d.arr[1] + d.arr[2] != 0 { return 6; };
+    if d.pair.0 != 0 { return 7; };
+    if d.inner.x != 0 { return 8; };
+    let mm = match d.mode { Mode::Off => { 1 }, Mode::On(v) => { v + 10 }, };
+    if mm != 10 { return 9; };
+    let direct = Mode::default();
+    let dm = match direct { Mode::Off => { 1 }, Mode::On(v) => { v + 10 }, };
+    if dm != 10 { return 10; };
+    println!("{}", mv + mm);
+    return 0;
+}

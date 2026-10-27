@@ -1,0 +1,35 @@
+#[derive(Clone)]
+struct Inner {
+    x: i32,
+}
+
+#[derive(Clone)]
+struct Outer {
+    n: i32,
+    name: String,
+    items: Vec<i32>,
+    maybe: Option<i32>,
+    inner: Inner,
+    tags: Vec<String>,
+}
+
+fn main() -> i32 {
+    let mut a = Outer { n: 1, name: format!("abc"), items: Vec::new(), maybe: Option::Some(9), inner: Inner { x: 5 }, tags: Vec::new() };
+    a.items.push(10);
+    a.items.push(20);
+    a.tags.push(format!("t1"));
+    let b = a.clone();
+    a.items.push(30);
+    a.tags.push(format!("t2"));
+    a.n = 99;
+    if len(b.items) != 2 { return 1; };
+    if len(b.tags) != 1 { return 2; };
+    if b.n != 1 { return 3; };
+    if str_eq(b.name, "abc") != true { return 4; };
+    if len(b.name) != 3 { return 5; };
+    let mv = match b.maybe { Option::Some(v) => { v }, Option::None => { 0 }, };
+    if mv != 9 { return 6; };
+    if b.inner.x != 5 { return 7; };
+    println!("{}", b.items[1] + len(b.tags) + mv);
+    return 0;
+}

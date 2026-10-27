@@ -1,0 +1,10 @@
+// EXPECT: SLARS-DERIVE-UNSUPPORTED
+#[derive(Clone)]
+enum Msg {
+    Quit,
+    Move(i32),
+}
+
+fn main() -> i32 {
+    return 0;
+}

@@ -1,0 +1,9 @@
+// EXPECT: SLARS-LOOP-VALUE
+fn f() -> i32 {
+    return loop {
+    };
+}
+
+fn main() -> i32 {
+    return f();
+}

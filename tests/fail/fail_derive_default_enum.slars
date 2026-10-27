@@ -1,0 +1,10 @@
+// EXPECT: SLARS-DERIVE-UNSUPPORTED
+#[derive(Default)]
+enum Mode {
+    Off,
+    On,
+}
+
+fn main() -> i32 {
+    return 0;
+}
