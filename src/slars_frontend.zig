@@ -627,6 +627,851 @@ fn skipItem(toks: []const Tok, source: []const u8, from: usize) usize {
     return i;
 }
 
+
+// ------------------------------------------------ phase 2: derive expansion
+//
+// `#[derive(Clone)]` / `#[derive(Default)]` are implemented in this frontend
+// layer (phase 1 rejected them: the shared SLA backend has no derive
+// implementation for them and faking one was not an option). The transform
+// generates inherent `impl` blocks with `clone` / `default` functions built
+// field by field from the surfaces that actually exist (see DESIGN phase-2
+// section for the per-form evidence table):
+//   - scalars / bool / char copy by value (char's default goes through the
+//     sa_std CHAR_FROM_U32_UNCHECKED macro, sa_std/char.sa);
+//   - String clones through the sa_std STRING_BUF_CLONE macro
+//     (sa_std/string.sa), a real allocate-and-copy deep clone;
+//   - Vec<T> clones element by element into a fresh Vec (the sa_std
+//     VEC_CLONE macro is a byte copy of the element buffer, which would be
+//     a shallow copy for handle elements, so it is NOT used);
+//   - Option<T> clones through a match;
+//   - tuple/array-typed values are rejected for Clone (the shared
+//     backend's tuple/array literal layout corrupts them before any clone
+//     could run; Default still supports them — the all-zero pattern is
+//     layout-invariant);
+//   - user types recurse through their own clone() / Type::default();
+//   - Arc / Rc clone through their native handle clone (sa_std/timer.sla
+//     uses `.clone()` on an Arc field the same way).
+// Forms with no real surface stay loudly rejected (SLARS-DERIVE-UNSUPPORTED):
+// references, slices, fn types, unsized `str`, the other std collections,
+// and enums for Clone (a borrowed enum cannot be inspected by the shared
+// backend: `match self` on `&Self` is a checker TypeMismatch, and
+// dereferencing a borrowed enum compiles but segfaults at run time in the
+// shared lowering — minimal repros are registered in DESIGN; the by-value
+// route consumes the source, which the SA referee rejects with
+// UseAfterMove when the source is used after `.clone()`).
+
+const TypeRange = struct { lo: usize, hi: usize };
+
+const FieldInfo = struct {
+    name: ?[]const u8, // null for tuple fields / tuple variants
+    type_lo: usize,
+    type_hi: usize,
+};
+
+const VariantInfo = struct {
+    name: []const u8,
+    payload: []FieldInfo, // empty for unit variants
+    named_payload: bool = false,
+    is_default: bool = false,
+    default_attr_idx: usize = 0, // '#' token index of a #[default] attribute
+};
+
+const TypeInfo = struct {
+    name: []const u8,
+    kind: enum { struct_named, struct_tuple, struct_unit, enum_ },
+    kw_idx: usize, // struct/enum keyword token index
+    end_idx: usize, // index just past the item
+    derives: [][]const u8,
+    generics: [][]const u8,
+    fields: []FieldInfo, // struct fields (empty for enums)
+    variants: []VariantInfo, // enum variants (empty for structs)
+    manual_clone: bool = false,
+    manual_default: bool = false,
+};
+
+fn findMatchBack(toks: []const Tok, source: []const u8, close_idx: usize, open: []const u8, close: []const u8) ?usize {
+    var depth: usize = 0;
+    var i = close_idx + 1;
+    while (i > 0) {
+        i -= 1;
+        const s = tokText(source, toks[i]);
+        if (toks[i].kind == .punct and std.mem.eql(u8, s, close)) {
+            depth += 1;
+        } else if (toks[i].kind == .punct and std.mem.eql(u8, s, open)) {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
+}
+
+/// Split the token range [lo, hi) at top-level commas.
+fn splitTopRanges(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, lo: usize, hi: usize) []TypeRange {
+    var out = std.array_list.Managed(TypeRange).init(allocator);
+    var depth: i64 = 0;
+    var start = lo;
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        if (toks[i].kind != .punct) continue;
+        const s = tokText(source, toks[i]);
+        if (std.mem.eql(u8, s, "(") or std.mem.eql(u8, s, "[") or std.mem.eql(u8, s, "{") or std.mem.eql(u8, s, "<")) {
+            depth += 1;
+        } else if (std.mem.eql(u8, s, ")") or std.mem.eql(u8, s, "]") or std.mem.eql(u8, s, "}") or std.mem.eql(u8, s, ">")) {
+            depth -= 1;
+        } else if (depth == 0 and std.mem.eql(u8, s, ",")) {
+            if (start < i) out.append(.{ .lo = start, .hi = i }) catch {};
+            start = i + 1;
+        }
+    }
+    if (start < hi) out.append(.{ .lo = start, .hi = hi }) catch {};
+    return out.toOwnedSlice() catch &.{};
+}
+
+/// The type text of a token range, lifetimes erased, tokens concatenated
+/// (type syntax needs no separators: `Vec < i32 >` -> `Vec<i32>`).
+fn typeText(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, lo: usize, hi: usize) []const u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        if (toks[i].kind == .lifetime) continue;
+        buf.appendSlice(tokText(source, toks[i])) catch {};
+    }
+    return buf.toOwnedSlice() catch "";
+}
+
+/// Skip leading `#[...]` attribute groups and `pub` in a field/variant
+/// segment; returns the adjusted start index. Records a leading
+/// `#[default]` attribute (enum variants) into `default_attr_idx`.
+fn stripItemPrefix(toks: []const Tok, source: []const u8, lo: usize, hi: usize, default_attr_idx: *usize) usize {
+    var j = lo;
+    while (j < hi) {
+        if (textEq(source, toks[j], "#") and j + 1 < hi and textEq(source, toks[j + 1], "[")) {
+            const close = findMatch(toks, source, j + 1, "[", "]") orelse return j;
+            if (j + 2 < close and textEq(source, toks[j + 2], "default")) default_attr_idx.* = j;
+            j = close + 1;
+            continue;
+        }
+        if (textEq(source, toks[j], "pub")) {
+            j += 1;
+            if (j < hi and textEq(source, toks[j], "(")) {
+                if (findMatch(toks, source, j, "(", ")")) |c| j = c + 1;
+            }
+            continue;
+        }
+        break;
+    }
+    return j;
+}
+
+fn parseNamedFields(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, lo: usize, hi: usize) []FieldInfo {
+    var fields = std.array_list.Managed(FieldInfo).init(allocator);
+    for (splitTopRanges(allocator, toks, source, lo, hi)) |seg| {
+        var dummy: usize = 0;
+        const j = stripItemPrefix(toks, source, seg.lo, seg.hi, &dummy);
+        if (j + 2 > seg.hi) continue;
+        if (toks[j].kind != .ident) continue;
+        if (!textEq(source, toks[j + 1], ":")) continue;
+        fields.append(.{ .name = tokText(source, toks[j]), .type_lo = j + 2, .type_hi = seg.hi }) catch {};
+    }
+    return fields.toOwnedSlice() catch &.{};
+}
+
+fn collectDerives(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, kw_idx: usize) [][]const u8 {
+    var names = std.array_list.Managed([]const u8).init(allocator);
+    var j = kw_idx;
+    while (j > 0) {
+        const k = j - 1;
+        if (toks[k].kind == .ident and textEq(source, toks[k], "pub")) {
+            j = k;
+            continue;
+        }
+        if (textEq(source, toks[k], "]")) {
+            const openb = findMatchBack(toks, source, k, "[", "]") orelse break;
+            if (openb == 0 or !textEq(source, toks[openb - 1], "#")) break;
+            if (openb + 1 < k and textEq(source, toks[openb + 1], "derive")) {
+                var m = openb + 2;
+                while (m < k) : (m += 1) {
+                    if (toks[m].kind == .ident) names.append(tokText(source, toks[m])) catch {};
+                }
+            }
+            j = openb - 1;
+            continue;
+        }
+        break;
+    }
+    return names.toOwnedSlice() catch &.{};
+}
+
+fn hasDerive(t: *const TypeInfo, name: []const u8) bool {
+    for (t.derives) |d| {
+        if (std.mem.eql(u8, d, name)) return true;
+    }
+    return false;
+}
+
+fn lookupType(types: []const TypeInfo, name: []const u8) ?*const TypeInfo {
+    for (types) |*t| {
+        if (std.mem.eql(u8, t.name, name)) return t;
+    }
+    return null;
+}
+
+/// Token-level table of the file's struct/enum declarations, their derive
+/// sets and field/variant shapes, plus manual `clone` / `default`
+/// implementations. Used by validation and by transform-time codegen.
+fn analyzeTypes(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8) []TypeInfo {
+    var types = std.array_list.Managed(TypeInfo).init(allocator);
+    var depth: i64 = 0;
+    var i: usize = 0;
+    while (i < toks.len) : (i += 1) {
+        const t = toks[i];
+        const s = tokText(source, t);
+        if (t.kind == .punct and std.mem.eql(u8, s, "{")) depth += 1;
+        if (t.kind == .punct and std.mem.eql(u8, s, "}")) depth -= 1;
+        if (depth != 0 or t.kind != .ident) continue;
+        const is_struct = std.mem.eql(u8, s, "struct");
+        const is_enum = std.mem.eql(u8, s, "enum");
+        if (!is_struct and !is_enum) continue;
+        if (i + 1 >= toks.len or toks[i + 1].kind != .ident) continue;
+        var info = TypeInfo{
+            .name = tokText(source, toks[i + 1]),
+            .kind = if (is_enum) .enum_ else .struct_named,
+            .kw_idx = i,
+            .end_idx = toks.len,
+            .derives = collectDerives(allocator, toks, source, i),
+            .generics = &.{},
+            .fields = &.{},
+            .variants = &.{},
+        };
+        var g = i + 2;
+        if (g < toks.len and textEq(source, toks[g], "<")) {
+            if (findAngleMatch(toks, source, g)) |close_a| {
+                var params = std.array_list.Managed([]const u8).init(allocator);
+                for (splitTopRanges(allocator, toks, source, g + 1, close_a)) |seg| {
+                    if (seg.lo < seg.hi and toks[seg.lo].kind == .ident) params.append(tokText(source, toks[seg.lo])) catch {};
+                }
+                info.generics = params.toOwnedSlice() catch &.{};
+                g = close_a + 1;
+            }
+        }
+        if (is_struct) {
+            if (g < toks.len and textEq(source, toks[g], "{")) {
+                if (findMatch(toks, source, g, "{", "}")) |close_b| {
+                    info.kind = .struct_named;
+                    info.fields = parseNamedFields(allocator, toks, source, g + 1, close_b);
+                    info.end_idx = close_b + 1;
+                }
+            } else if (g < toks.len and textEq(source, toks[g], "(")) {
+                if (findMatch(toks, source, g, "(", ")")) |close_p| {
+                    info.kind = .struct_tuple;
+                    var fl = std.array_list.Managed(FieldInfo).init(allocator);
+                    for (splitTopRanges(allocator, toks, source, g + 1, close_p)) |seg| {
+                        fl.append(.{ .name = null, .type_lo = seg.lo, .type_hi = seg.hi }) catch {};
+                    }
+                    info.fields = fl.toOwnedSlice() catch &.{};
+                    info.end_idx = close_p + 1;
+                    if (info.end_idx < toks.len and textEq(source, toks[info.end_idx], ";")) info.end_idx += 1;
+                }
+            } else if (g < toks.len and textEq(source, toks[g], ";")) {
+                info.kind = .struct_unit;
+                info.end_idx = g + 1;
+            }
+        } else {
+            if (g < toks.len and textEq(source, toks[g], "{")) {
+                if (findMatch(toks, source, g, "{", "}")) |close_b| {
+                    var vars = std.array_list.Managed(VariantInfo).init(allocator);
+                    for (splitTopRanges(allocator, toks, source, g + 1, close_b)) |seg| {
+                        var dflt_attr: usize = 0;
+                        const j = stripItemPrefix(toks, source, seg.lo, seg.hi, &dflt_attr);
+                        if (j >= seg.hi or toks[j].kind != .ident) continue;
+                        var v = VariantInfo{
+                            .name = tokText(source, toks[j]),
+                            .payload = &.{},
+                            .is_default = dflt_attr != 0,
+                            .default_attr_idx = dflt_attr,
+                        };
+                        if (j + 1 < seg.hi and textEq(source, toks[j + 1], "(")) {
+                            if (findMatch(toks, source, j + 1, "(", ")")) |close_p| {
+                                var fl = std.array_list.Managed(FieldInfo).init(allocator);
+                                for (splitTopRanges(allocator, toks, source, j + 2, close_p)) |ps| {
+                                    fl.append(.{ .name = null, .type_lo = ps.lo, .type_hi = ps.hi }) catch {};
+                                }
+                                v.payload = fl.toOwnedSlice() catch &.{};
+                            }
+                        } else if (j + 1 < seg.hi and textEq(source, toks[j + 1], "{")) {
+                            if (findMatch(toks, source, j + 1, "{", "}")) |close_v| {
+                                v.payload = parseNamedFields(allocator, toks, source, j + 2, close_v);
+                                v.named_payload = true;
+                            }
+                        }
+                        vars.append(v) catch {};
+                    }
+                    info.variants = vars.toOwnedSlice() catch &.{};
+                    info.end_idx = close_b + 1;
+                }
+            }
+        }
+        types.append(info) catch {};
+    }
+    // Manual inherent implementations: `impl Name { ... }` /
+    // `impl Trait for Name { ... }` — record hand-written clone/default.
+    depth = 0;
+    i = 0;
+    while (i < toks.len) : (i += 1) {
+        const t = toks[i];
+        const s = tokText(source, t);
+        if (t.kind == .punct and std.mem.eql(u8, s, "{")) depth += 1;
+        if (t.kind == .punct and std.mem.eql(u8, s, "}")) depth -= 1;
+        if (depth != 0 or t.kind != .ident or !std.mem.eql(u8, s, "impl")) continue;
+        var j = i + 1;
+        if (j < toks.len and textEq(source, toks[j], "<")) {
+            if (findAngleMatch(toks, source, j)) |close_a| j = close_a + 1;
+        }
+        if (j >= toks.len or toks[j].kind != .ident) continue;
+        var name = tokText(source, toks[j]);
+        j += 1;
+        if (j + 1 < toks.len and textEq(source, toks[j], "for") and toks[j + 1].kind == .ident) {
+            name = tokText(source, toks[j + 1]);
+            j += 2;
+        }
+        if (j >= toks.len or !textEq(source, toks[j], "{")) continue;
+        const close_b = findMatch(toks, source, j, "{", "}") orelse continue;
+        var d: i64 = 1;
+        var k = j + 1;
+        while (k < close_b) : (k += 1) {
+            const ks = tokText(source, toks[k]);
+            if (toks[k].kind == .punct and std.mem.eql(u8, ks, "{")) d += 1;
+            if (toks[k].kind == .punct and std.mem.eql(u8, ks, "}")) d -= 1;
+            if (d == 1 and toks[k].kind == .ident and std.mem.eql(u8, ks, "fn") and k + 1 < close_b and toks[k + 1].kind == .ident) {
+                const fname = tokText(source, toks[k + 1]);
+                for (types.items) |*ti| {
+                    if (!std.mem.eql(u8, ti.name, name)) continue;
+                    if (std.mem.eql(u8, fname, "clone")) ti.manual_clone = true;
+                    if (std.mem.eql(u8, fname, "default")) ti.manual_default = true;
+                }
+            }
+        }
+    }
+    return types.toOwnedSlice() catch &.{};
+}
+
+// ---------------------------------------------------------- type forms
+
+const TypeClass = union(enum) {
+    copy_scalar: []const u8, // integer / float / bool type name
+    char_t,
+    string_t,
+    vec_of: TypeRange,
+    option_of: TypeRange,
+    array_of: struct { elem: TypeRange, n: usize },
+    tuple_of: []TypeRange,
+    user: []const u8, // last path segment of a named type
+    arc_rc,
+    unsupported: []const u8,
+};
+
+fn isScalarName(name: []const u8) bool {
+    const list = [_][]const u8{ "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool" };
+    for (list) |x| {
+        if (std.mem.eql(u8, name, x)) return true;
+    }
+    return false;
+}
+
+fn classifyType(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, lo: usize, hi: usize) TypeClass {
+    if (lo >= hi) return .{ .unsupported = "an empty type" };
+    const first = tokText(source, toks[lo]);
+    if (std.mem.eql(u8, first, "&")) {
+        return .{ .unsupported = "reference types have no Clone/Default surface in slars phase 2" };
+    }
+    if (std.mem.eql(u8, first, "[")) {
+        const close = findMatch(toks, source, lo, "[", "]") orelse return .{ .unsupported = "a malformed array type" };
+        if (close != hi - 1) return .{ .unsupported = "a malformed array type" };
+        var semi: ?usize = null;
+        var d: i64 = 0;
+        var k = lo + 1;
+        while (k < close) : (k += 1) {
+            if (toks[k].kind != .punct) continue;
+            const ks = tokText(source, toks[k]);
+            if (std.mem.eql(u8, ks, "[") or std.mem.eql(u8, ks, "(") or std.mem.eql(u8, ks, "<")) d += 1;
+            if (std.mem.eql(u8, ks, "]") or std.mem.eql(u8, ks, ")") or std.mem.eql(u8, ks, ">")) d -= 1;
+            if (d == 0 and std.mem.eql(u8, ks, ";")) semi = k;
+        }
+        if (semi == null) return .{ .unsupported = "slice types [T] have no fixed size and no Clone/Default surface in slars phase 2" };
+        const n_idx = semi.? + 1;
+        if (n_idx + 1 != close or toks[n_idx].kind != .number) return .{ .unsupported = "array lengths must be integer literals in slars phase 2" };
+        const n = std.fmt.parseInt(usize, tokText(source, toks[n_idx]), 10) catch return .{ .unsupported = "array lengths must be integer literals in slars phase 2" };
+        return .{ .array_of = .{ .elem = .{ .lo = lo + 1, .hi = semi.? }, .n = n } };
+    }
+    if (std.mem.eql(u8, first, "(")) {
+        const close = findMatch(toks, source, lo, "(", ")") orelse return .{ .unsupported = "a malformed tuple type" };
+        if (close != hi - 1) return .{ .unsupported = "a malformed tuple type" };
+        const parts = splitTopRanges(allocator, toks, source, lo + 1, close);
+        if (parts.len == 0) return .{ .unsupported = "unit-typed fields have no Clone/Default surface in slars phase 2" };
+        if (parts.len == 1) return classifyType(allocator, toks, source, parts[0].lo, parts[0].hi);
+        return .{ .tuple_of = parts };
+    }
+    // Named type: ident (:: ident)* with an optional <args> tail.
+    if (toks[lo].kind == .ident) {
+        var j = lo;
+        var base = tokText(source, toks[j]);
+        j += 1;
+        while (j + 1 < hi and textEq(source, toks[j], "::") and toks[j + 1].kind == .ident) {
+            base = tokText(source, toks[j + 1]);
+            j += 2;
+        }
+        var args: ?TypeRange = null;
+        if (j < hi and textEq(source, toks[j], "<")) {
+            const close_a = findAngleMatch(toks, source, j) orelse return .{ .unsupported = "a malformed generic type" };
+            if (close_a != hi - 1) return .{ .unsupported = "a malformed generic type" };
+            args = .{ .lo = j + 1, .hi = close_a };
+        } else if (j != hi) {
+            return .{ .unsupported = "an unsupported type form" };
+        }
+        if (isScalarName(base)) return .{ .copy_scalar = base };
+        if (std.mem.eql(u8, base, "char")) return .char_t;
+        if (std.mem.eql(u8, base, "String")) return .string_t;
+        if (std.mem.eql(u8, base, "str")) return .{ .unsupported = "str is an unsized slice type with no Clone/Default surface in slars phase 2" };
+        if (std.mem.eql(u8, base, "Vec")) {
+            if (args) |a| {
+                const parts = splitTopRanges(allocator, toks, source, a.lo, a.hi);
+                if (parts.len == 1) return .{ .vec_of = parts[0] };
+            }
+            return .{ .unsupported = "a Vec type without exactly one element type" };
+        }
+        if (std.mem.eql(u8, base, "Option")) {
+            if (args) |a| {
+                const parts = splitTopRanges(allocator, toks, source, a.lo, a.hi);
+                if (parts.len == 1) return .{ .option_of = parts[0] };
+            }
+            return .{ .unsupported = "an Option type without exactly one element type" };
+        }
+        if (std.mem.eql(u8, base, "Arc") or std.mem.eql(u8, base, "Rc")) return .arc_rc;
+        const no_surface = [_][]const u8{ "HashMap", "HashSet", "BTreeMap", "BTreeSet", "VecDeque", "LinkedList", "Box", "Cell", "RefCell", "Mutex", "RwLock" };
+        for (no_surface) |x| {
+            if (std.mem.eql(u8, base, x)) return .{ .unsupported = "this std collection/handle type has no adjudicated Clone/Default surface in slars phase 2" };
+        }
+        return .{ .user = base };
+    }
+    return .{ .unsupported = "an unsupported type form" };
+}
+
+/// Recursive Clone check for one field type. Returns a rejection reason or
+/// null when the form is supported.
+fn cloneRejectReason(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, types: []const TypeInfo, generics: [][]const u8, lo: usize, hi: usize) ?[]const u8 {
+    switch (classifyType(allocator, toks, source, lo, hi)) {
+        .unsupported => |r| return r,
+        .copy_scalar, .char_t, .string_t, .arc_rc => return null,
+        .vec_of => |r| return cloneRejectReason(allocator, toks, source, types, generics, r.lo, r.hi),
+        .option_of => |r| return cloneRejectReason(allocator, toks, source, types, generics, r.lo, r.hi),
+        // Tuple/array values are rejected for Clone: the shared backend
+        // constructs tuple/array literals with an i64-slot layout that
+        // disagrees with its own typed accesses (declared element sizes),
+        // so the values are corrupt (or the process segfaults) before any
+        // clone could run — proven with hand-written SLA repros that use
+        // no slars feature at all (registered in DESIGN). Default is not
+        // affected: the all-zero bit pattern reads identically under both
+        // layouts.
+        .array_of, .tuple_of => return "tuple/array-typed values cannot be cloned in slars phase 2: the shared backend's tuple/array literal layout disagrees with its typed accesses and corrupts such values (see DESIGN); the restriction lifts when that backend defect is fixed",
+        .user => |name| {
+            for (generics) |g| {
+                if (std.mem.eql(u8, g, name)) return null; // generic parameter: passed through to its clone()
+            }
+            if (lookupType(types, name)) |tt| {
+                if (tt.kind == .enum_) return "enums cannot derive Clone in slars phase 2 (the shared backend cannot inspect a borrowed enum; see DESIGN)";
+                if (hasDerive(tt, "Clone") or tt.manual_clone) return null;
+                return "the nested type does not derive Clone and has no manual clone()";
+            }
+            return null; // imported type: its own file's frontend generated (or rejected) its impls
+        },
+    }
+}
+
+/// Recursive Default check for one field type.
+fn defaultRejectReason(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, types: []const TypeInfo, generics: [][]const u8, lo: usize, hi: usize) ?[]const u8 {
+    switch (classifyType(allocator, toks, source, lo, hi)) {
+        .unsupported => |r| return r,
+        .copy_scalar, .char_t, .string_t => return null,
+        .arc_rc => return "Arc/Rc fields have no Default surface in slars phase 2",
+        .vec_of, .option_of => return null,
+        .array_of => |a| return defaultRejectReason(allocator, toks, source, types, generics, a.elem.lo, a.elem.hi),
+        .tuple_of => |parts| {
+            for (parts) |p| {
+                if (defaultRejectReason(allocator, toks, source, types, generics, p.lo, p.hi)) |r| return r;
+            }
+            return null;
+        },
+        .user => |name| {
+            for (generics) |g| {
+                if (std.mem.eql(u8, g, name)) return null; // generic parameter: passed through to its Type::default()
+            }
+            if (lookupType(types, name)) |tt| {
+                if (hasDerive(tt, "Default") or tt.manual_default) return null;
+                return "the nested type does not derive Default and has no manual default()";
+            }
+            return null; // imported type: passed through to its Type::default()
+        },
+    }
+}
+
+// ---------------------------------------------------------- derive codegen
+
+const DeriveGen = struct {
+    allocator: std.mem.Allocator,
+    toks: []const Tok,
+    source: []const u8,
+    types: []const TypeInfo,
+    helpers: std.array_list.Managed([]const u8), // generated helper fn texts
+    helper_types: std.array_list.Managed([]const u8), // type text per registered helper
+    helper_names: std.array_list.Managed([]const u8), // fn name per registered helper
+    helper_count: usize = 0,
+    need_string: bool = false,
+    need_char: bool = false,
+};
+
+fn mangleTypeName(allocator: std.mem.Allocator, tt: []const u8, idx: usize) []const u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
+    buf.appendSlice("__slars_clone_") catch {};
+    for (tt) |c| {
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') {
+            buf.append(c) catch {};
+        } else {
+            buf.append('_') catch {};
+        }
+    }
+    buf.appendSlice("_") catch {};
+    const num = std.fmt.allocPrint(allocator, "{d}", .{idx}) catch "";
+    buf.appendSlice(num) catch {};
+    return buf.toOwnedSlice() catch "__slars_clone_x";
+}
+
+const GenError = error{ UnsupportedField, OutOfMemory };
+
+/// The clone expression for a value of the given type located at `place`.
+/// Container forms route through generated per-type helper functions so
+/// their bodies can use statements (loops, matches) freely.
+fn genCloneExpr(g: *DeriveGen, place: []const u8, lo: usize, hi: usize) GenError![]const u8 {
+    const a = g.allocator;
+    switch (classifyType(a, g.toks, g.source, lo, hi)) {
+        .unsupported => return error.UnsupportedField,
+        .copy_scalar, .char_t => return place,
+        .string_t => {
+            g.need_string = true;
+            return std.fmt.allocPrint(a, "STRING_BUF_CLONE({s})", .{place});
+        },
+        .arc_rc, .user => return std.fmt.allocPrint(a, "{s}.clone()", .{place}),
+        .vec_of, .option_of, .array_of, .tuple_of => {
+            const helper = try genCloneHelper(g, lo, hi);
+            return std.fmt.allocPrint(a, "{s}({s})", .{ helper, place });
+        },
+    }
+}
+
+fn genCloneHelper(g: *DeriveGen, lo: usize, hi: usize) GenError![]const u8 {
+    const a = g.allocator;
+    const tt = typeText(a, g.toks, g.source, lo, hi);
+    for (g.helper_types.items, 0..) |existing, idx| {
+        if (std.mem.eql(u8, existing, tt)) return g.helper_names.items[idx];
+    }
+    const name = mangleTypeName(a, tt, g.helper_count);
+    g.helper_count += 1;
+    try g.helper_types.append(tt);
+    try g.helper_names.append(name);
+    var body = std.array_list.Managed(u8).init(a);
+    body.appendSlice("fn ") catch {};
+    body.appendSlice(name) catch {};
+    body.appendSlice("(x: ") catch {};
+    body.appendSlice(tt) catch {};
+    body.appendSlice(") -> ") catch {};
+    body.appendSlice(tt) catch {};
+    body.appendSlice(" {\n") catch {};
+    switch (classifyType(a, g.toks, g.source, lo, hi)) {
+        .vec_of => |r| {
+            const inner = try genCloneExpr(g, "x[__i]", r.lo, r.hi);
+            body.appendSlice("    let __c = Vec::new();\n    for __i in 0..len(x) {\n        __c.push(") catch {};
+            body.appendSlice(inner) catch {};
+            body.appendSlice(");\n    }\n    return __c;\n}\n") catch {};
+        },
+        .option_of => |r| {
+            const inner = try genCloneExpr(g, "v", r.lo, r.hi);
+            body.appendSlice("    return match x {\n        Option::Some(v) => { Option::Some(") catch {};
+            body.appendSlice(inner) catch {};
+            body.appendSlice(") },\n        Option::None => { Option::None },\n    };\n}\n") catch {};
+        },
+        .array_of => |arr| {
+            body.appendSlice("    return [") catch {};
+            var k: usize = 0;
+            while (k < arr.n) : (k += 1) {
+                if (k > 0) body.appendSlice(", ") catch {};
+                const place = std.fmt.allocPrint(a, "x[{d}]", .{k}) catch "";
+                body.appendSlice(try genCloneExpr(g, place, arr.elem.lo, arr.elem.hi)) catch {};
+            }
+            body.appendSlice("];\n}\n") catch {};
+        },
+        .tuple_of => |parts| {
+            body.appendSlice("    return (") catch {};
+            for (parts, 0..) |p, idx| {
+                if (idx > 0) body.appendSlice(", ") catch {};
+                const place = std.fmt.allocPrint(a, "x.{d}", .{idx}) catch "";
+                body.appendSlice(try genCloneExpr(g, place, p.lo, p.hi)) catch {};
+            }
+            body.appendSlice(");\n}\n") catch {};
+        },
+        else => return error.UnsupportedField,
+    }
+    try g.helpers.append(body.toOwnedSlice() catch "");
+    return name;
+}
+
+fn genDefaultExpr(g: *DeriveGen, lo: usize, hi: usize) GenError![]const u8 {
+    const a = g.allocator;
+    switch (classifyType(a, g.toks, g.source, lo, hi)) {
+        .unsupported, .arc_rc => return error.UnsupportedField,
+        .copy_scalar => |name| {
+            if (std.mem.eql(u8, name, "bool")) return "false";
+            if (std.mem.eql(u8, name, "f32") or std.mem.eql(u8, name, "f64")) return "0.0";
+            return "0";
+        },
+        .char_t => {
+            g.need_char = true;
+            return "CHAR_FROM_U32_UNCHECKED(0)";
+        },
+        .string_t => return "format(\"\")",
+        .vec_of => return "Vec::new()",
+        .option_of => return "Option::None",
+        .array_of => |arr| {
+            const inner = try genDefaultExpr(g, arr.elem.lo, arr.elem.hi);
+            var buf = std.array_list.Managed(u8).init(a);
+            buf.appendSlice("[") catch {};
+            var k: usize = 0;
+            while (k < arr.n) : (k += 1) {
+                if (k > 0) buf.appendSlice(", ") catch {};
+                buf.appendSlice(inner) catch {};
+            }
+            buf.appendSlice("]") catch {};
+            return buf.toOwnedSlice() catch "";
+        },
+        .tuple_of => |parts| {
+            var buf = std.array_list.Managed(u8).init(a);
+            buf.appendSlice("(") catch {};
+            for (parts, 0..) |p, idx| {
+                if (idx > 0) buf.appendSlice(", ") catch {};
+                buf.appendSlice(try genDefaultExpr(g, p.lo, p.hi)) catch {};
+            }
+            buf.appendSlice(")") catch {};
+            return buf.toOwnedSlice() catch "";
+        },
+        .user => |name| {
+            // Enums route through the generated free helper: an associated
+            // `Enum::default()` call anywhere in the module corrupts the
+            // shared checker's enum-literal resolution for that enum.
+            if (lookupType(g.types, name)) |tt| {
+                if (tt.kind == .enum_) {
+                    return std.fmt.allocPrint(a, "__slars_default_{s}()", .{name});
+                }
+            }
+            const tt = typeText(a, g.toks, g.source, lo, hi);
+            return std.fmt.allocPrint(a, "{s}::default()", .{tt});
+        },
+    }
+}
+
+/// Generate the `impl` block for one type's frontend-implemented derives.
+/// Returns null when nothing should be generated (validation reports the
+/// reason for root files; imported files fail loudly at the use site).
+fn genDeriveImpl(g: *DeriveGen, t: *const TypeInfo) ?[]const u8 {
+    const a = g.allocator;
+    var buf = std.array_list.Managed(u8).init(a);
+    if (hasDerive(t, "Clone") and t.kind != .enum_) {
+        if (t.kind == .struct_unit) {
+            buf.appendSlice("\nimpl ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice(" {\n    fn clone(&self) -> Self {\n        return Self;\n    }\n}\n") catch {};
+        } else {
+            var stmts = std.array_list.Managed(u8).init(a);
+            var assigns = std.array_list.Managed(u8).init(a);
+            for (t.fields, 0..) |f, idx| {
+                const place = if (f.name) |n| std.fmt.allocPrint(a, "self.{s}", .{n}) catch "" else std.fmt.allocPrint(a, "self.{d}", .{idx}) catch "";
+                const expr = genCloneExpr(g, place, f.type_lo, f.type_hi) catch return null;
+                const tmp = std.fmt.allocPrint(a, "__slars_f{d}", .{idx}) catch "";
+                stmts.appendSlice("        let ") catch {};
+                stmts.appendSlice(tmp) catch {};
+                stmts.appendSlice(" = ") catch {};
+                stmts.appendSlice(expr) catch {};
+                stmts.appendSlice(";\n") catch {};
+                if (idx > 0) assigns.appendSlice(", ") catch {};
+                if (f.name) |n| {
+                    assigns.appendSlice(n) catch {};
+                    assigns.appendSlice(": ") catch {};
+                }
+                assigns.appendSlice(tmp) catch {};
+            }
+            buf.appendSlice("\nimpl ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice(" {\n    fn clone(&self) -> Self {\n") catch {};
+            buf.appendSlice(stmts.toOwnedSlice() catch "") catch {};
+            if (t.kind == .struct_named) {
+                buf.appendSlice("        return Self { ") catch {};
+                buf.appendSlice(assigns.toOwnedSlice() catch "") catch {};
+                buf.appendSlice(" }") catch {};
+            } else {
+                // `Self(...)` is not a call the shared checker resolves;
+                // tuple constructors go through the type name.
+                buf.appendSlice("        return ") catch {};
+                buf.appendSlice(t.name) catch {};
+                buf.appendSlice("(") catch {};
+                buf.appendSlice(assigns.toOwnedSlice() catch "") catch {};
+                buf.appendSlice(")") catch {};
+            }
+            buf.appendSlice(";\n    }\n}\n") catch {};
+        }
+    }
+    if (hasDerive(t, "Default")) {
+        if (t.kind == .enum_) {
+            var chosen: ?*const VariantInfo = null;
+            var count: usize = 0;
+            for (t.variants) |*v| {
+                if (v.is_default) {
+                    chosen = v;
+                    count += 1;
+                }
+            }
+            if (count != 1) return null;
+            const v = chosen.?;
+            // A free helper, not an impl method: once the shared checker
+            // has checked an associated call on an enum (`Mode::default()`),
+            // every enum literal for that enum in the module fails with
+            // FieldNotFound (registered backend defect; minimal repro in
+            // DESIGN). The transform rewrites `Mode::default()` call sites
+            // to this helper, so no associated call is ever emitted.
+            buf.appendSlice("\nfn __slars_default_") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice("() -> ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice(" {\n    return ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice("::") catch {};
+            buf.appendSlice(v.name) catch {};
+            if (v.named_payload) {
+                buf.appendSlice(" { ") catch {};
+                for (v.payload, 0..) |f, idx| {
+                    if (idx > 0) buf.appendSlice(", ") catch {};
+                    buf.appendSlice(f.name.?) catch {};
+                    buf.appendSlice(": ") catch {};
+                    buf.appendSlice(genDefaultExpr(g, f.type_lo, f.type_hi) catch return null) catch {};
+                }
+                buf.appendSlice(" }") catch {};
+            } else if (v.payload.len > 0) {
+                buf.appendSlice("(") catch {};
+                for (v.payload, 0..) |f, idx| {
+                    if (idx > 0) buf.appendSlice(", ") catch {};
+                    buf.appendSlice(genDefaultExpr(g, f.type_lo, f.type_hi) catch return null) catch {};
+                }
+                buf.appendSlice(")") catch {};
+            }
+            buf.appendSlice(";\n}\n") catch {};
+        } else if (t.kind == .struct_unit) {
+            buf.appendSlice("\nimpl ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice(" {\n    fn default() -> Self {\n        return Self;\n    }\n}\n") catch {};
+        } else {
+            var assigns = std.array_list.Managed(u8).init(a);
+            for (t.fields, 0..) |f, idx| {
+                if (idx > 0) assigns.appendSlice(", ") catch {};
+                if (f.name) |n| {
+                    assigns.appendSlice(n) catch {};
+                    assigns.appendSlice(": ") catch {};
+                }
+                assigns.appendSlice(genDefaultExpr(g, f.type_lo, f.type_hi) catch return null) catch {};
+            }
+            buf.appendSlice("\nimpl ") catch {};
+            buf.appendSlice(t.name) catch {};
+            buf.appendSlice(" {\n    fn default() -> Self {\n") catch {};
+            if (t.kind == .struct_named) {
+                buf.appendSlice("        return Self { ") catch {};
+                buf.appendSlice(assigns.toOwnedSlice() catch "") catch {};
+                buf.appendSlice(" }") catch {};
+            } else {
+                buf.appendSlice("        return ") catch {};
+                buf.appendSlice(t.name) catch {};
+                buf.appendSlice("(") catch {};
+                buf.appendSlice(assigns.toOwnedSlice() catch "") catch {};
+                buf.appendSlice(")") catch {};
+            }
+            buf.appendSlice(";\n    }\n}\n") catch {};
+        }
+    }
+    if (buf.items.len == 0) return null;
+    return buf.toOwnedSlice() catch null;
+}
+
+// ------------------------------------------------ loop-value parsing (shared)
+
+const LetLoopInfo = struct {
+    name: []const u8,
+    type_lo: usize, // type_hi == type_lo when there is no annotation
+    type_hi: usize,
+    brace_idx: usize, // index of the loop body's '{'
+};
+
+/// Match `let [mut] name [: Type] = loop {` starting at the `let` token.
+fn parseLetLoop(toks: []const Tok, source: []const u8, let_idx: usize) ?LetLoopInfo {
+    var j = let_idx + 1;
+    if (j < toks.len and textEq(source, toks[j], "mut")) j += 1;
+    if (j >= toks.len or toks[j].kind != .ident) return null;
+    const name = tokText(source, toks[j]);
+    j += 1;
+    var type_lo: usize = 0;
+    var type_hi: usize = 0;
+    if (j < toks.len and textEq(source, toks[j], ":")) {
+        type_lo = j + 1;
+        var d: i64 = 0;
+        var k = type_lo;
+        while (k < toks.len) : (k += 1) {
+            if (toks[k].kind != .punct) continue;
+            const ks = tokText(source, toks[k]);
+            if (std.mem.eql(u8, ks, "<") or std.mem.eql(u8, ks, "(") or std.mem.eql(u8, ks, "[")) d += 1;
+            if (std.mem.eql(u8, ks, ">") or std.mem.eql(u8, ks, ")") or std.mem.eql(u8, ks, "]")) d -= 1;
+            if (d == 0 and std.mem.eql(u8, ks, "=")) break;
+        }
+        if (k >= toks.len) return null;
+        type_hi = k;
+        j = k;
+    }
+    if (j >= toks.len or !textEq(source, toks[j], "=")) return null;
+    if (j + 2 >= toks.len) return null;
+    if (!textEq(source, toks[j + 1], "loop")) return null;
+    if (!textEq(source, toks[j + 2], "{")) return null;
+    return .{ .name = name, .type_lo = type_lo, .type_hi = type_hi, .brace_idx = j + 2 };
+}
+
+fn isDefaultEnum(types: []const TypeInfo, name: []const u8) bool {
+    if (lookupType(types, name)) |t| {
+        return t.kind == .enum_ and hasDerive(t, "Default");
+    }
+    return false;
+}
+
+const P2_IMPORT_STRING = "@import \"sa_std/string.sa\"\n";
+const P2_IMPORT_CHAR = "@import \"sa_std/char.sa\"\n";
+
+fn escapeRawString(allocator: std.mem.Allocator, content: []const u8) []const u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
+    buf.append('"') catch {};
+    for (content) |ch| {
+        switch (ch) {
+            '"' => buf.appendSlice("\\\"") catch {},
+            '\\' => buf.appendSlice("\\\\") catch {},
+            '\n' => buf.appendSlice("\\n") catch {},
+            '\t' => buf.appendSlice("\\t") catch {},
+            '\r' => buf.appendSlice("\\r") catch {},
+            else => buf.append(ch) catch {},
+        }
+    }
+    buf.append('"') catch {};
+    return buf.toOwnedSlice() catch "\"\"";
+}
+
 // --------------------------------------------------------------- transform
 
 const MacroAction = enum { none, println_like, vec, assert_macro, assert_cmp, panic_call, stringify, concat, cfg_macro, todo_like, reject };
@@ -749,6 +1594,38 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
     var range_plus_pending = false;
     var unsafe_semi_at: ?usize = null;
 
+    // Phase 2: derive impl insertions + loop-value frame tracking.
+    const p2_types = analyzeTypes(allocator, toks, source);
+    var p2_gen = DeriveGen{
+        .allocator = allocator,
+        .toks = toks,
+        .source = source,
+        .types = p2_types,
+        .helpers = std.array_list.Managed([]const u8).init(allocator),
+        .helper_types = std.array_list.Managed([]const u8).init(allocator),
+        .helper_names = std.array_list.Managed([]const u8).init(allocator),
+    };
+    const Insertion = struct { at_idx: usize, kw_idx: usize, text: []const u8 };
+    var insertions = std.array_list.Managed(Insertion).init(allocator);
+    for (p2_types) |*ti| {
+        if (!hasDerive(ti, "Clone") and !hasDerive(ti, "Default")) continue;
+        if (ti.kind == .enum_ and hasDerive(ti, "Clone") and !hasDerive(ti, "Default")) continue;
+        const helpers_before = p2_gen.helpers.items.len;
+        if (genDeriveImpl(&p2_gen, ti)) |impl_text| {
+            var full = std.array_list.Managed(u8).init(allocator);
+            for (p2_gen.helpers.items[helpers_before..]) |h| full.appendSlice(h) catch {};
+            full.appendSlice(impl_text) catch {};
+            insertions.append(.{ .at_idx = ti.end_idx, .kw_idx = ti.kw_idx, .text = full.toOwnedSlice() catch "" }) catch {};
+        }
+    }
+    var insertion_ptr: usize = 0;
+    var tframes = std.array_list.Managed(TFrame).init(allocator);
+    var pend_value: ?TValueCtx = null;
+    var pend_plain = false;
+    var pend_fn = false;
+    var post_close: ?TFrame = null;
+    var swallow_semi = false;
+
     const emit = struct {
         fn seg(out2: *std.array_list.Managed(u8), segs2: *std.array_list.Managed([]const u8), source2: []const u8, t: Tok, replacement: ?[]const u8) !void {
             try appendPrefixNorm(out2, source2, t.pre_start, t.start);
@@ -772,6 +1649,39 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
             in_for_header = false;
         }
 
+        // Phase 2: flush generated derive impls scheduled before this token.
+        while (insertion_ptr < insertions.items.len and insertions.items[insertion_ptr].at_idx <= i) {
+            out.appendSlice(insertions.items[insertion_ptr].text) catch {};
+            segs.append("impl") catch {};
+            insertion_ptr += 1;
+        }
+
+        // Phase 2: brace frame tracking for loop-value break rewriting.
+        if (t.kind == .punct and std.mem.eql(u8, s, "{")) {
+            if (pend_value) |ctx| {
+                tframes.append(.{ .kind = .value, .ctx = ctx }) catch {};
+                pend_value = null;
+            } else if (pend_fn) {
+                tframes.append(.{ .kind = .fn_body }) catch {};
+                pend_fn = false;
+            } else if (pend_plain) {
+                tframes.append(.{ .kind = .plain_loop }) catch {};
+                pend_plain = false;
+            } else {
+                tframes.append(.{ .kind = .other }) catch {};
+            }
+        }
+        if (t.kind == .punct and std.mem.eql(u8, s, "}")) {
+            if (tframes.items.len > 0) post_close = tframes.pop();
+        }
+        if (t.kind == .punct and std.mem.eql(u8, s, ";") and swallow_semi) {
+            appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+            segs.append("") catch {};
+            swallow_semi = false;
+            i += 1;
+            continue;
+        }
+
         // ---- attributes
         if (t.kind == .punct and std.mem.eql(u8, s, "#") and next_idx != null and textEq(source, toks[next_idx.?], "[")) {
             const open = next_idx.?;
@@ -792,13 +1702,19 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                         if (deriveMapped(tokText(source, toks[k]))) |m| names.append(m) catch {};
                     }
                 }
-                out.appendSlice("@derive(") catch {};
-                for (names.items, 0..) |nm, idx| {
-                    if (idx > 0) out.appendSlice(", ") catch {};
-                    out.appendSlice(nm) catch {};
+                if (names.items.len > 0) {
+                    out.appendSlice("@derive(") catch {};
+                    for (names.items, 0..) |nm, idx| {
+                        if (idx > 0) out.appendSlice(", ") catch {};
+                        out.appendSlice(nm) catch {};
+                    }
+                    out.appendSlice(")") catch {};
+                    segs.append("@derive") catch {};
+                } else {
+                    // Every derive in the list is frontend-implemented
+                    // (Clone/Default): emit no backend annotation.
+                    segs.append("") catch {};
                 }
-                out.appendSlice(")") catch {};
-                segs.append("@derive") catch {};
             } else if (std.mem.eql(u8, attr_name, "cfg")) {
                 var cfg_lo = inner_lo + 1;
                 var cfg_hi = close;
@@ -811,6 +1727,9 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                 if (!keep) {
                     // Drop the following item as well.
                     const end = skipItem(toks, source, close + 1);
+                    for (insertions.items) |*ins| {
+                        if (ins.kw_idx >= i and ins.kw_idx < end) ins.at_idx = std.math.maxInt(usize);
+                    }
                     const nl = countNewlines(source, toks, i, end);
                     for (0..nl) |_| out.append('\n') catch {};
                     i = end;
@@ -924,9 +1843,97 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                     continue;
                 }
             }
+            // ---- phase 2: loop value in return position
+            if (std.mem.eql(u8, s, "return") and i + 2 < toks.len and textEq(source, toks[i + 1], "loop") and textEq(source, toks[i + 2], "{")) {
+                appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+                out.appendSlice("{ while true") catch {};
+                segs.append("{ while true") catch {};
+                pend_value = .{ .ret_mode = true };
+                pend_plain = false;
+                pend_fn = false;
+                i = i + 2;
+                continue;
+            }
+            // ---- phase 2: loop value in let position (slot seeded from
+            // the annotated type's Default form)
+            if (std.mem.eql(u8, s, "let")) {
+                if (parseLetLoop(toks, source, i)) |ll| {
+                    var seed: ?[]const u8 = null;
+                    if (ll.type_hi > ll.type_lo) {
+                        if (genDefaultExpr(&p2_gen, ll.type_lo, ll.type_hi)) |sd| {
+                            seed = sd;
+                        } else |_| {}
+                    }
+                    if (seed) |sd| {
+                        appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+                        out.appendSlice("let ") catch {};
+                        out.appendSlice(ll.name) catch {};
+                        out.appendSlice(" = ") catch {};
+                        out.appendSlice(sd) catch {};
+                        out.appendSlice(";\nwhile true") catch {};
+                        segs.append("while true") catch {};
+                        pend_value = .{ .ret_mode = false, .slot = ll.name };
+                        pend_plain = false;
+                        pend_fn = false;
+                        i = ll.brace_idx;
+                        continue;
+                    }
+                }
+            }
+            // ---- phase 2: loop value in assignment position
+            if (i + 3 < toks.len and textEq(source, toks[i + 1], "=") and textEq(source, toks[i + 2], "loop") and textEq(source, toks[i + 3], "{")) {
+                const prev_ok = i == 0 or (textEq(source, toks[i - 1], ";") or textEq(source, toks[i - 1], "{") or textEq(source, toks[i - 1], "}"));
+                if (prev_ok) {
+                    appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+                    out.appendSlice("while true") catch {};
+                    segs.append("while true") catch {};
+                    pend_value = .{ .ret_mode = false, .slot = s };
+                    pend_plain = false;
+                    pend_fn = false;
+                    i = i + 3;
+                    continue;
+                }
+            }
+            // ---- phase 2: break with a value owned by a loop-value body
+            if (std.mem.eql(u8, s, "break")) {
+                if (valueOwnerCtx(&tframes)) |ctx| {
+                    if (ctx.ret_mode) {
+                        emit.seg(&out, &segs, source, t, "return") catch {};
+                        i += 1;
+                        continue;
+                    }
+                    if (findBreakSemi(toks, source, i)) |semi| {
+                        appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+                        out.appendSlice(ctx.slot) catch {};
+                        out.appendSlice(" =") catch {};
+                        var k = i + 1;
+                        while (k < semi) : (k += 1) {
+                            const kt = toks[k];
+                            if (kt.kind == .char_lit) {
+                                const cp = charCodepoint(source, kt);
+                                const buf = std.fmt.allocPrint(allocator, "{d}", .{cp}) catch "0";
+                                emit.seg(&out, &segs, source, kt, buf) catch {};
+                            } else if (kt.kind == .raw_string) {
+                                const content = rawStringContent(source, kt);
+                                emit.seg(&out, &segs, source, kt, escapeRawString(allocator, content)) catch {};
+                            } else if (kt.kind == .lifetime) {
+                                appendPrefixNorm(&out, source, kt.pre_start, kt.start) catch {};
+                                segs.append("") catch {};
+                            } else {
+                                emit.seg(&out, &segs, source, kt, null) catch {};
+                            }
+                        }
+                        out.appendSlice("; break;") catch {};
+                        segs.append("break") catch {};
+                        i = semi + 1;
+                        continue;
+                    }
+                }
+            }
             // ---- loop -> while true
             if (std.mem.eql(u8, s, "loop") and std.mem.eql(u8, next_text, "{")) {
                 emit.seg(&out, &segs, source, t, "while true") catch {};
+                pend_plain = true;
                 i += 1;
                 continue;
             }
@@ -957,6 +1964,21 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                 continue;
             }
             if (std.mem.eql(u8, s, "for")) in_for_header = true;
+
+            // ---- phase 2: `Enum::default()` associated calls on a
+            // Default-deriving enum of this file route to the generated
+            // free helper (an associated call on an enum corrupts the
+            // shared checker's enum-literal resolution module-wide).
+            if (i + 3 < toks.len and textEq(source, toks[i + 1], "::") and textEq(source, toks[i + 2], "default") and textEq(source, toks[i + 3], "(")) {
+                if (i == 0 or !textEq(source, toks[i - 1], "::")) {
+                    if (isDefaultEnum(p2_types, s)) {
+                        const helper = std.fmt.allocPrint(allocator, "__slars_default_{s}", .{s}) catch "";
+                        emit.seg(&out, &segs, source, t, helper) catch {};
+                        i = i + 3;
+                        continue;
+                    }
+                }
+            }
 
             // ---- macro calls: ident '!' ...
             if (next_idx != null and textEq(source, toks[next_idx.?], "!")) {
@@ -1155,13 +2177,37 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                 segs.append(";") catch {};
             }
         }
+        // Phase 2: a closed loop-value body in return position gets its
+        // unreachable tail; the source `;` after any loop-value body is
+        // swallowed (the lowered form is a statement, not an expression).
+        if (post_close) |fr| {
+            post_close = null;
+            if (fr.kind == .value) {
+                if (fr.ctx.ret_mode) {
+                    out.appendSlice(" panic(917776); }") catch {};
+                    segs.append("}") catch {};
+                }
+                swallow_semi = true;
+            }
+        }
+        if (t.kind == .ident) {
+            if (std.mem.eql(u8, s, "while") or std.mem.eql(u8, s, "for")) pend_plain = true;
+            if (std.mem.eql(u8, s, "fn")) pend_fn = true;
+        }
         i += 1;
     }
 
+    while (insertion_ptr < insertions.items.len and insertions.items[insertion_ptr].at_idx <= toks.len) {
+        out.appendSlice(insertions.items[insertion_ptr].text) catch {};
+        insertion_ptr += 1;
+    }
+
     const body = out.toOwnedSlice() catch return source;
-    if (needs_macro_import) {
+    if (needs_macro_import or p2_gen.need_string or p2_gen.need_char) {
         var full = std.array_list.Managed(u8).init(allocator);
         full.appendSlice("@import \"sla_std/std_macros.sla\"\n") catch return body;
+        if (p2_gen.need_string) full.appendSlice(P2_IMPORT_STRING) catch return body;
+        if (p2_gen.need_char) full.appendSlice(P2_IMPORT_CHAR) catch return body;
         full.appendSlice(body) catch return body;
         return full.toOwnedSlice() catch body;
     }
@@ -1448,6 +2494,7 @@ fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []con
         }
     }
     // Attribute pass (needs '#' tokens, which are punct kind)
+    const p2_types = analyzeTypes(allocator, toks, source);
     i = 0;
     while (i < toks.len) : (i += 1) {
         const t = toks[i];
@@ -1464,11 +2511,17 @@ fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []con
                 const dn = tokText(source, toks[k]);
                 if (deriveMapped(dn) == null) {
                     if (std.mem.eql(u8, dn, "Clone") or std.mem.eql(u8, dn, "Default")) {
-                        return failDiagFmt(allocator, stderr, file, t.line, "SLARS-DERIVE-UNSUPPORTED", "derive({s}) has no implementation in the shared SLA backend and is rejected rather than faked", .{dn});
+                        // Phase 2: implemented by this frontend (impl
+                        // blocks are generated at transform time); the
+                        // field forms are validated in validateDerives.
+                        continue;
                     }
                     return failDiagFmt(allocator, stderr, file, t.line, "SLARS-DERIVE-UNSUPPORTED", "derive({s}) is not in the slars phase-1 derive set (Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)", .{dn});
                 }
             }
+        } else if (std.mem.eql(u8, name, "default") and isDefaultVariantAttr(p2_types, i)) {
+            // #[default] marker on a variant of a Default-deriving enum;
+            // consumed by the phase-2 Default expansion.
         } else if (std.mem.eql(u8, name, "cfg") or std.mem.eql(u8, name, "test")) {
             // supported
         } else if (isErasableAttr(name)) {
@@ -1478,7 +2531,313 @@ fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []con
         }
         i = close;
     }
+    if (!validateDerives(allocator, toks, source, p2_types, file, stderr)) return false;
+    if (!validateLoops(allocator, toks, source, p2_types, file, stderr)) return false;
     return true;
+}
+
+
+// ------------------------------------------------ phase 2: derive validation
+
+fn isDefaultVariantAttr(types: []const TypeInfo, attr_idx: usize) bool {
+    for (types) |*t| {
+        for (t.variants) |*v| {
+            if (v.is_default and v.default_attr_idx == attr_idx) return true;
+        }
+    }
+    return false;
+}
+
+fn fieldLabel(allocator: std.mem.Allocator, f: *const FieldInfo, idx: usize) []const u8 {
+    if (f.name) |n| return n;
+    return std.fmt.allocPrint(allocator, "{d}", .{idx}) catch "?";
+}
+
+fn validateDerives(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, types: []const TypeInfo, file: []const u8, stderr: *std.Io.Writer) bool {
+    for (types) |*t| {
+        const line = toks[t.kw_idx].line;
+        if (t.kind == .enum_ and !hasDerive(t, "Default")) {
+            for (t.variants) |*v| {
+                if (v.is_default) {
+                    return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "#[default] on enum '{s}' has no effect without derive(Default)", .{t.name});
+                }
+            }
+        }
+        if (t.kind == .struct_unit and (hasDerive(t, "Clone") or hasDerive(t, "Default"))) {
+            return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "unit struct '{s}' cannot derive Clone/Default: unit structs have no value form in the shared SLA surface (the struct name is not an expression there), so no clone/default value can be produced", .{t.name});
+        }
+        if (hasDerive(t, "Clone")) {
+            if (t.manual_clone) {
+                return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "type '{s}' derives Clone but also has a manual clone() implementation; keep exactly one", .{t.name});
+            }
+            if (t.kind == .enum_) {
+                return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Clone) on enum '{s}' is not supported in slars phase 2: the shared backend cannot inspect a borrowed enum (match on &Self fails the checker and dereferencing a borrowed enum segfaults in the shared lowering), and a by-value clone would consume the source", .{t.name});
+            }
+            for (t.fields, 0..) |*f, idx| {
+                if (cloneRejectReason(allocator, toks, source, types, t.generics, f.type_lo, f.type_hi)) |r| {
+                    return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Clone) on '{s}', field '{s}': {s}", .{ t.name, fieldLabel(allocator, f, idx), r });
+                }
+            }
+        }
+        if (hasDerive(t, "Default")) {
+            if (t.manual_default) {
+                return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "type '{s}' derives Default but also has a manual default() implementation; keep exactly one", .{t.name});
+            }
+            if (t.kind == .enum_) {
+                var chosen: ?*const VariantInfo = null;
+                var count: usize = 0;
+                for (t.variants) |*v| {
+                    if (v.is_default) {
+                        chosen = v;
+                        count += 1;
+                    }
+                }
+                if (count == 0) {
+                    return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Default) on enum '{s}' requires exactly one variant marked #[default]", .{t.name});
+                }
+                if (count > 1) {
+                    return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Default) on enum '{s}' has more than one #[default] variant", .{t.name});
+                }
+                for (chosen.?.payload, 0..) |*f, idx| {
+                    if (defaultRejectReason(allocator, toks, source, types, t.generics, f.type_lo, f.type_hi)) |r| {
+                        return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Default) on enum '{s}', #[default] variant payload '{s}': {s}", .{ t.name, fieldLabel(allocator, f, idx), r });
+                    }
+                }
+            } else {
+                for (t.fields, 0..) |*f, idx| {
+                    if (defaultRejectReason(allocator, toks, source, types, t.generics, f.type_lo, f.type_hi)) |r| {
+                        return failDiagFmt(allocator, stderr, file, line, "SLARS-DERIVE-UNSUPPORTED", "derive(Default) on '{s}', field '{s}': {s}", .{ t.name, fieldLabel(allocator, f, idx), r });
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// ------------------------------------------------ phase 2: loop values
+//
+// A `loop` may produce a value in exactly three positions, lowered by the
+// transform to the shared backend's statement forms:
+//   return loop { ... break v; }   -> { while true { ... return v; } panic; }
+//   x = loop { ... }               -> while true { ... x = v; break; }
+//   let x: T = loop { ... }        -> let x = <T's Default>; while true { ... }
+// Any other use of a valued break is rejected here, loudly, instead of
+// reaching the shared parser as a bare `break v` syntax error.
+
+const VFrameKind = enum { value_ret, value_slot, plain_loop, while_for, expr_loop, fn_body, other };
+const VFrame = struct { kind: VFrameKind, has_valued: bool = false, kw_line: usize = 0, slot: bool = false };
+
+fn findStmtStart(toks: []const Tok, source: []const u8, eq_idx: usize) usize {
+    var depth: i64 = 0;
+    var k = eq_idx;
+    while (k > 0) {
+        k -= 1;
+        if (toks[k].kind != .punct) continue;
+        const s = tokText(source, toks[k]);
+        if (depth == 0 and (std.mem.eql(u8, s, ";") or std.mem.eql(u8, s, "}"))) return k + 1;
+        if (std.mem.eql(u8, s, ")") or std.mem.eql(u8, s, "]") or std.mem.eql(u8, s, "}")) {
+            depth += 1;
+        } else if (std.mem.eql(u8, s, "(") or std.mem.eql(u8, s, "[") or std.mem.eql(u8, s, "{")) {
+            if (depth == 0 and std.mem.eql(u8, s, "{")) return k + 1;
+            depth -= 1;
+            if (depth < 0) return k + 1;
+        }
+    }
+    return 0;
+}
+
+const LoopPos = struct { kind: enum { stmt, ret, let_, assign, expr }, stmt_start: usize = 0 };
+
+fn loopPosition(toks: []const Tok, source: []const u8, i: usize) LoopPos {
+    if (i == 0) return .{ .kind = .stmt };
+    const prev = tokText(source, toks[i - 1]);
+    if (std.mem.eql(u8, prev, ";") or std.mem.eql(u8, prev, "{") or std.mem.eql(u8, prev, "}")) return .{ .kind = .stmt };
+    if (std.mem.eql(u8, prev, "else")) return .{ .kind = .stmt };
+    if (toks[i - 1].kind == .ident and std.mem.eql(u8, prev, "return")) return .{ .kind = .ret };
+    if (std.mem.eql(u8, prev, "=")) {
+        const ss = findStmtStart(toks, source, i - 1);
+        if (ss < toks.len and toks[ss].kind == .ident and std.mem.eql(u8, tokText(source, toks[ss]), "let")) {
+            return .{ .kind = .let_, .stmt_start = ss };
+        }
+        if (ss + 1 == i - 1 and toks[ss].kind == .ident) return .{ .kind = .assign, .stmt_start = ss };
+        return .{ .kind = .expr };
+    }
+    return .{ .kind = .expr };
+}
+
+fn insideValueLoop(frames: *const std.array_list.Managed(VFrame)) bool {
+    for (frames.items) |fr| {
+        if (fr.kind == .value_ret or fr.kind == .value_slot) return true;
+    }
+    return false;
+}
+
+fn validateLoops(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, types: []const TypeInfo, file: []const u8, stderr: *std.Io.Writer) bool {
+    var frames = std.array_list.Managed(VFrame).init(allocator);
+    var pend: ?VFrame = null;
+    var i: usize = 0;
+    while (i < toks.len) : (i += 1) {
+        const t = toks[i];
+        const s = tokText(source, t);
+        if (t.kind == .punct and std.mem.eql(u8, s, "{")) {
+            frames.append(pend orelse .{ .kind = .other }) catch {};
+            pend = null;
+            continue;
+        }
+        if (t.kind == .punct and std.mem.eql(u8, s, "}")) {
+            if (frames.items.len > 0) {
+                const fr = frames.pop().?;
+                if ((fr.kind == .value_ret or fr.kind == .value_slot) and !fr.has_valued) {
+                    return failDiag(stderr, file, fr.kw_line, "SLARS-LOOP-VALUE", "loop used as a value never breaks with a value (its Rust type would be ()); give it a valued break or use it as a statement");
+                }
+            }
+            continue;
+        }
+        if (t.kind != .ident) continue;
+        if (std.mem.eql(u8, s, "fn")) {
+            pend = .{ .kind = .fn_body };
+            continue;
+        }
+        if (std.mem.eql(u8, s, "while") or std.mem.eql(u8, s, "for")) {
+            pend = .{ .kind = .while_for };
+            continue;
+        }
+        if (std.mem.eql(u8, s, "loop") and i + 1 < toks.len and textEq(source, toks[i + 1], "{")) {
+            const pos = loopPosition(toks, source, i);
+            switch (pos.kind) {
+                .stmt => pend = .{ .kind = .plain_loop, .kw_line = t.line },
+                .expr => pend = .{ .kind = .expr_loop, .kw_line = t.line },
+                .ret => {
+                    if (insideValueLoop(&frames)) {
+                        return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "nested loop values are not supported in slars phase 2 (a loop used as a value inside another loop-value body)");
+                    }
+                    pend = .{ .kind = .value_ret, .kw_line = t.line };
+                },
+                .assign => {
+                    if (insideValueLoop(&frames)) {
+                        return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "nested loop values are not supported in slars phase 2 (a loop used as a value inside another loop-value body)");
+                    }
+                    pend = .{ .kind = .value_slot, .kw_line = t.line, .slot = true };
+                },
+                .let_ => {
+                    if (insideValueLoop(&frames)) {
+                        return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "nested loop values are not supported in slars phase 2 (a loop used as a value inside another loop-value body)");
+                    }
+                    const ll = parseLetLoop(toks, source, pos.stmt_start) orelse {
+                        pend = .{ .kind = .expr_loop, .kw_line = t.line };
+                        continue;
+                    };
+                    if (ll.type_hi == ll.type_lo) {
+                        return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "a let-bound loop value needs a type annotation: the transform seeds the slot from the annotated type's Default form (write `let x: i32 = loop { ... }`)");
+                    }
+                    if (defaultRejectReason(allocator, toks, source, types, &.{}, ll.type_lo, ll.type_hi)) |r| {
+                        return failDiagFmt(allocator, stderr, file, t.line, "SLARS-LOOP-VALUE", "the loop value's annotated type has no Default form to seed the slot: {s}", .{r});
+                    }
+                    pend = .{ .kind = .value_slot, .kw_line = t.line, .slot = true };
+                },
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, s, "break")) {
+            const valued = i + 1 < toks.len and !textEq(source, toks[i + 1], ";") and !textEq(source, toks[i + 1], "}");
+            var owner: ?*VFrame = null;
+            scan: {
+                var oi = frames.items.len;
+                while (oi > 0) {
+                    oi -= 1;
+                    switch (frames.items[oi].kind) {
+                        .value_ret, .value_slot, .plain_loop, .while_for, .expr_loop, .fn_body => {
+                            owner = &frames.items[oi];
+                            break :scan;
+                        },
+                        .other => {},
+                    }
+                }
+            }
+            if (owner == null) {
+                if (valued) return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "break with a value outside any loop");
+                continue;
+            }
+            switch (owner.?.kind) {
+                .fn_body => {
+                    if (valued) return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "break with a value is not inside a loop");
+                },
+                .plain_loop => {
+                    if (valued) return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "break with a value in a statement loop: the value would be discarded (use the loop as a let initializer, an assignment right-hand side, or a return value — or break without a value)");
+                },
+                .while_for => {
+                    if (valued) return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "while/for loops cannot yield a value; break with a value is only allowed in loop");
+                },
+                .expr_loop => {
+                    if (valued) return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "loop used as a value in an unsupported position: slars phase 2 supports loop values only as a let initializer, an assignment right-hand side, or a return value");
+                },
+                .value_ret, .value_slot => {
+                    if (!valued) {
+                        return failDiag(stderr, file, t.line, "SLARS-LOOP-VALUE", "plain break in a loop used as a value: the target would keep its seed value (break with a value instead)");
+                    }
+                    owner.?.has_valued = true;
+                    if (owner.?.slot) {
+                        // The slot lowering copies the break expression at
+                        // token level; macro calls inside it are rejected.
+                        var d: i64 = 0;
+                        var k = i + 1;
+                        while (k < toks.len) : (k += 1) {
+                            if (toks[k].kind == .punct) {
+                                const ks = tokText(source, toks[k]);
+                                if (std.mem.eql(u8, ks, "(") or std.mem.eql(u8, ks, "[") or std.mem.eql(u8, ks, "{")) d += 1;
+                                if (std.mem.eql(u8, ks, ")") or std.mem.eql(u8, ks, "]") or std.mem.eql(u8, ks, "}")) d -= 1;
+                                if (d == 0 and std.mem.eql(u8, ks, ";")) break;
+                            }
+                            if (toks[k].kind == .ident and k + 1 < toks.len and textEq(source, toks[k + 1], "!") and macroAction(tokText(source, toks[k])) != .none) {
+                                return failDiagFmt(allocator, stderr, file, t.line, "SLARS-LOOP-VALUE", "macro call {s}! inside the break expression of a slot-lowered loop is not supported in slars phase 2; bind the value to a local first", .{tokText(source, toks[k])});
+                            }
+                        }
+                    }
+                },
+                .other => {},
+            }
+            continue;
+        }
+    }
+    return true;
+}
+
+// ------------------------------------------------ phase 2: transform frames
+
+const TValueCtx = struct { ret_mode: bool, slot: []const u8 = "" };
+const TFrame = struct { kind: enum { value, plain_loop, fn_body, other }, ctx: TValueCtx = .{ .ret_mode = false } };
+
+fn valueOwnerCtx(frames: *const std.array_list.Managed(TFrame)) ?TValueCtx {
+    var i = frames.items.len;
+    while (i > 0) {
+        i -= 1;
+        switch (frames.items[i].kind) {
+            .value => return frames.items[i].ctx,
+            .plain_loop, .fn_body => return null,
+            .other => continue,
+        }
+    }
+    return null;
+}
+
+/// Index of the `;` terminating a `break` at break_idx (relative depth 0).
+fn findBreakSemi(toks: []const Tok, source: []const u8, break_idx: usize) ?usize {
+    var d: i64 = 0;
+    var k = break_idx + 1;
+    while (k < toks.len) : (k += 1) {
+        if (toks[k].kind != .punct) continue;
+        const ks = tokText(source, toks[k]);
+        if (std.mem.eql(u8, ks, "(") or std.mem.eql(u8, ks, "[") or std.mem.eql(u8, ks, "{")) {
+            d += 1;
+        } else if (std.mem.eql(u8, ks, ")") or std.mem.eql(u8, ks, "]") or std.mem.eql(u8, ks, "}")) {
+            d -= 1;
+            if (d < 0) return null;
+        } else if (d == 0 and std.mem.eql(u8, ks, ";")) {
+            return k;
+        }
+    }
+    return null;
 }
 
 // ------------------------------------------------------------ strict check
