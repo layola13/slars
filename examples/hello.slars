@@ -1,0 +1,8 @@
+// slars M1 smoke: Rust surface in, shared SLA backend out.
+fn main() -> i32 {
+    let mut n = 40;
+    n = n + 2;
+    println!("hello, slars");
+    println!("{}", n);
+    return 0;
+}

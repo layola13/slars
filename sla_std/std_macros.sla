@@ -1,0 +1,18 @@
+// slars standard macro library (hand-written, shipped with slars).
+//
+// Per the slars phase-1 macro ruling, the whitelist macros that the SLA
+// macro layer CAN express live here as ordinary SLA macros, imported
+// automatically by the slars frontend (transformSource prepends
+// @import "sla_std/std_macros.sla" when a file uses them). Users may
+// extend this file. Macros that the macro layer provably cannot express
+// (imported-macro arguments substituted into builtin call positions are
+// corrupted by the shared backend) are implemented in the compiler
+// frontend instead; see DESIGN.md section 7.2 for the per-item routing.
+
+macro SLARS_ASSERT(cond) {
+    if !cond { panic(917001); };
+}
+
+macro SLARS_PANIC_MSG(msg) {
+    panic(msg);
+}

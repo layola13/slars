@@ -1,0 +1,1 @@
+../../sa_plugin_sla/src/plugin_compile_options.zig

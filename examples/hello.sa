@@ -1,0 +1,38 @@
+@import "sa_std/string.sa"
+@import "sa_std/string_format.sa"
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/core/panic.sa"
+
+[MACRO] SLA_ARRAY_FILL_U8 %array_ptr, %value, %length
+    call @sa_mem_set(&%array_ptr, %value, %length)
+[END_MACRO]
+@const SLA_FNPTR_VT_main = vtable { call = @main }
+@main() -> i32:
+L_ENTRY:
+    tmp_0 = 40
+    n = add tmp_0, 0
+    !tmp_0
+    tmp_1 = 2
+    tmp_2 = add n, tmp_1
+    !tmp_1
+    !n
+    n = tmp_2
+    @const SLA_STR_0 = utf8:"hello, slars"
+    call @sa_print_bytes(&SLA_STR_0, 12)
+    @const SLA_STR_1 = utf8:"\n"
+    call @sa_print_bytes(&SLA_STR_1, 1)
+    tmp_3 = call @sa_fmt_u64(n, 10)
+    tmp_4 = call @sa_fmt_buffer_data(tmp_3)
+    tmp_5 = call @sa_fmt_buffer_len(tmp_3)
+    tmp_6 = tmp_4
+    call @sa_print_bytes(&tmp_6, tmp_5)
+    call @sa_fmt_buffer_free(^tmp_3)
+    !tmp_6
+    !tmp_5
+    @const SLA_STR_2 = utf8:"\n"
+    call @sa_print_bytes(&SLA_STR_2, 1)
+    tmp_7 = 0
+    !n
+    return tmp_7
+

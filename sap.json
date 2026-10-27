@@ -1,0 +1,77 @@
+{
+  "schema": "sa.plugin/1",
+  "name": "slars",
+  "version": "0.1.0",
+  "source": {
+    "type": "local",
+    "path": "."
+  },
+  "abi": {
+    "plugin": 1,
+    "saasm": ">=0.4.0"
+  },
+  "artifacts": {
+    "linux-x86_64": {
+      "path": "zig-out/lib/libslars.so"
+    },
+    "windows-x86_64": {
+      "path": "zig-out/bin/slars.dll"
+    }
+  },
+  "interfaces": {},
+  "skills": [
+    "slars"
+  ],
+  "help": "usage: slars <command> [options]\n       sa slars <command> [options]\n\nCommands:\n  init       [path]\n  skills     [--json]\n  stability  schema|verify ...\n  build      [file] [-p <package>] [--out <file>]\n  build-workspace [-p <package>] [sa-build-exe args]\n  build-exe  [file] [-p <package>] [sa-build-exe args]\n  build-wasm [file] [-p <package>] [sa-build-wasm args]\n  build-js   [file] [-p <package>] [sa-build-js args]\n  build-c    [file] [-p <package>] [sa-build-c args]\n  sab build  [file] [-p <package>] [--out <file.sab>]\n  sab workspace [-p <package>] [--sab-out <file.sab>] [sa-build-exe args]\n  sab disasm <file.sab> [--out <file.sa>]\n  slab build|workspace|disasm ...    Short alias\n  check      [file] [-p <package>]\n  test       [file] [-p <package>] [--test-backend auto|sab|sa] [sa-test args]\n\nOptions:\n  -p, --package <name>                    Select a workspace member package\n  --json                                  Emit JSON where supported\n  -h, --help                              Show this help message\n",
+  "permissions": {
+    "fs": [
+      {
+        "op": "read",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "write",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "create",
+        "path": "$PROJECT/**"
+      }
+    ],
+    "net": [
+      {
+        "url": "http://localhost",
+        "methods": [
+          "GET"
+        ]
+      },
+      {
+        "url": "http://127.0.0.1",
+        "methods": [
+          "GET"
+        ]
+      }
+    ],
+    "env": [
+      "HOME",
+      "PATH",
+      "SA_*"
+    ],
+    "process": {
+      "spawn": true,
+      "exec": [
+        {
+          "path": "/opt/zig/zig",
+          "args": [
+            "*"
+          ]
+        }
+      ]
+    }
+  },
+  "dependencies": {},
+  "kind": "language",
+  "language_extensions": [
+    ".slars"
+  ]
+}
