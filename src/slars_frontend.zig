@@ -16,7 +16,7 @@
 //   2. checkSource: root-file validation + the slars strict checker
 //      (SLARS-IMMUTABLE-ASSIGN, SLARS-BORROW-CONFLICT,
 //      SLARS-BORROW-IMMUTABLE) plus loud rejections (macro definitions,
-//      `static`, raw strings, non-whitelist macros, unsupported derives /
+//      `static`, byte strings, non-whitelist macros, unsupported derives /
 //      attributes, format specifiers, non-prelude `use`). It runs in
 //      plugin_compile's runSlaFrontend for `.slars` roots only.
 //
@@ -356,6 +356,130 @@ fn charCodepoint(source: []const u8, t: Tok) u32 {
     return dec;
 }
 
+fn isWellFormedRawString(txt: []const u8) bool {
+    // txt must be: r #* "..." #* with equal hash counts and a closing quote
+    // in the terminator position. The tokenizer stops at the first valid
+    // terminator or at EOF, so an unterminated literal is exactly one whose
+    // text does not end with '"' followed by the opening hash count.
+    if (txt.len < 3 or txt[0] != 'r') return false;
+    var i: usize = 1;
+    var hashes: usize = 0;
+    while (i < txt.len and txt[i] == '#') {
+        hashes += 1;
+        i += 1;
+    }
+    if (i >= txt.len or txt[i] != '"') return false;
+    if (txt.len < i + 2 + hashes) return false;
+    if (txt[txt.len - 1 - hashes] != '"') return false;
+    var k: usize = 0;
+    while (k < hashes) : (k += 1) {
+        if (txt[txt.len - hashes + k] != '#') return false;
+    }
+    return true;
+}
+
+// Index of the '{' that opens a match body, searching from token `from`
+// (just past the `match` keyword); null when the scrutinee never reaches a
+// body (malformed input — the shared parser will diagnose it). Skips
+// parenthesised/bracketed regions, closure bodies (a '{' directly after a
+// '|' token) and nested match constructs in the scrutinee.
+fn matchBodyOpen(toks: []const Tok, source: []const u8, from: usize) ?usize {
+    var paren: i32 = 0;
+    var bracket: i32 = 0;
+    var j = from;
+    while (j < toks.len) : (j += 1) {
+        const tx = tokText(source, toks[j]);
+        if (paren == 0 and bracket == 0) {
+            if (toks[j].kind == .ident and std.mem.eql(u8, tx, "match")) {
+                if (matchBodyOpen(toks, source, j + 1)) |bo| {
+                    if (findMatch(toks, source, bo, "{", "}")) |bc| {
+                        j = bc;
+                        continue;
+                    }
+                }
+                return null;
+            }
+            if (std.mem.eql(u8, tx, "{")) {
+                if (j > 0 and std.mem.eql(u8, tokText(source, toks[j - 1]), "|")) {
+                    if (findMatch(toks, source, j, "{", "}")) |bc| {
+                        j = bc;
+                        continue;
+                    }
+                    return null;
+                }
+                return j;
+            }
+            if (std.mem.eql(u8, tx, "}") or std.mem.eql(u8, tx, ";")) return null;
+        }
+        if (std.mem.eql(u8, tx, "(")) paren += 1;
+        if (std.mem.eql(u8, tx, ")")) paren -= 1;
+        if (std.mem.eql(u8, tx, "[")) bracket += 1;
+        if (std.mem.eql(u8, tx, "]")) bracket -= 1;
+    }
+    return null;
+}
+
+const MatchArm = struct {
+    pat_lo: usize,
+    pat_hi: usize, // token range of the pattern, [lo, hi)
+    body_lo: usize,
+    body_hi: usize, // token range of the body, [lo, hi)
+    body_is_block: bool,
+    next: usize, // first token after the arm (past an optional comma)
+};
+
+// Parse one match arm starting at token `start`, bounded by `body_close`
+// (the match body's closing brace index). Null on shapes the token grammar
+// cannot delimit (struct patterns, stray tokens) — callers then leave the
+// construct to the shared parser / the validator's own diagnostics.
+fn parseMatchArm(toks: []const Tok, source: []const u8, start: usize, body_close: usize) ?MatchArm {
+    var paren: i32 = 0;
+    var bracket: i32 = 0;
+    var j = start;
+    var arrow: ?usize = null;
+    while (j < body_close) : (j += 1) {
+        const tx = tokText(source, toks[j]);
+        if (paren == 0 and bracket == 0) {
+            if (std.mem.eql(u8, tx, "=>")) {
+                arrow = j;
+                break;
+            }
+            if (std.mem.eql(u8, tx, "{") or std.mem.eql(u8, tx, ";")) return null;
+        }
+        if (std.mem.eql(u8, tx, "(")) paren += 1;
+        if (std.mem.eql(u8, tx, ")")) paren -= 1;
+        if (std.mem.eql(u8, tx, "[")) bracket += 1;
+        if (std.mem.eql(u8, tx, "]")) bracket -= 1;
+    }
+    const aidx = arrow orelse return null;
+    const body_lo = aidx + 1;
+    if (body_lo >= body_close or body_lo >= toks.len) return null;
+    if (body_lo < toks.len and textEq(source, toks[body_lo], "{")) {
+        const bc = findMatch(toks, source, body_lo, "{", "}") orelse return null;
+        var nxt = bc + 1;
+        if (nxt < toks.len and textEq(source, toks[nxt], ",")) nxt += 1;
+        return .{ .pat_lo = start, .pat_hi = aidx, .body_lo = body_lo, .body_hi = bc + 1, .body_is_block = true, .next = nxt };
+    }
+    // Expression body: scan to a top-level comma or the body close brace.
+    paren = 0;
+    bracket = 0;
+    var brace: i32 = 0;
+    j = body_lo;
+    while (j < body_close) : (j += 1) {
+        const tx = tokText(source, toks[j]);
+        if (paren == 0 and bracket == 0 and brace == 0 and std.mem.eql(u8, tx, ",")) break;
+        if (std.mem.eql(u8, tx, "(")) paren += 1;
+        if (std.mem.eql(u8, tx, ")")) paren -= 1;
+        if (std.mem.eql(u8, tx, "[")) bracket += 1;
+        if (std.mem.eql(u8, tx, "]")) bracket -= 1;
+        if (std.mem.eql(u8, tx, "{")) brace += 1;
+        if (std.mem.eql(u8, tx, "}")) brace -= 1;
+    }
+    var nxt = j;
+    if (nxt < toks.len and textEq(source, toks[nxt], ",")) nxt += 1;
+    return .{ .pat_lo = start, .pat_hi = aidx, .body_lo = body_lo, .body_hi = j, .body_is_block = false, .next = nxt };
+}
+
 fn rawStringContent(source: []const u8, t: Tok) []const u8 {
     const s = tokText(source, t);
     const first = std.mem.indexOfScalar(u8, s, '"') orelse return "";
@@ -520,6 +644,102 @@ fn macroAction(name: []const u8) MacroAction {
     return .none;
 }
 
+
+// Rewrite one match construct starting at token `match_idx`: expression
+// arms are wrapped in blocks (the shared backend's match is a general
+// expression but requires block arms), and or-patterns whose alternatives
+// bind identical names are split into one arm per alternative with the
+// body duplicated. Returns the token index just past the match body, or
+// null when the construct is not token-delimitable — the caller then
+// emits it unchanged and the shared parser (or the root validator)
+// produces the diagnostic.
+fn emitMatch(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), segs: *std.array_list.Managed([]const u8), toks: []const Tok, source: []const u8, match_idx: usize) ?usize {
+    const body_open = matchBodyOpen(toks, source, match_idx + 1) orelse return null;
+    const body_close = findMatch(toks, source, body_open, "{", "}") orelse return null;
+    // Parse all arms first: a malformed arm aborts the takeover untouched.
+    var arms = std.array_list.Managed(MatchArm).init(allocator);
+    var pos = body_open + 1;
+    while (pos < body_close) {
+        if (textEq(source, toks[pos], ",")) {
+            pos += 1;
+            continue;
+        }
+        const arm = parseMatchArm(toks, source, pos, body_close) orelse return null;
+        if (arm.body_hi <= arm.body_lo) return null;
+        arms.append(arm) catch return null;
+        pos = arm.next;
+    }
+    const mt = toks[match_idx];
+    appendPrefixNorm(out, source, mt.pre_start, mt.start) catch return null;
+    out.appendSlice("match") catch return null;
+    segs.append("match") catch return null;
+    const scrut = transformSource(allocator, source[mt.end..toks[body_open].start]);
+    out.appendSlice(scrut) catch return null;
+    out.appendSlice("{ ") catch return null;
+    for (arms.items) |arm| {
+        // Split the pattern on top-level '|' (or-pattern alternatives).
+        var alt_lo = arm.pat_lo;
+        var alt_idx = arm.pat_lo;
+        var paren: i32 = 0;
+        var first_alt = true;
+        while (true) {
+            const at_end = alt_idx >= arm.pat_hi;
+            const is_bar = !at_end and paren == 0 and textEq(source, toks[alt_idx], "|");
+            if (!at_end) {
+                const tx = tokText(source, toks[alt_idx]);
+                if (std.mem.eql(u8, tx, "(")) paren += 1;
+                if (std.mem.eql(u8, tx, ")")) paren -= 1;
+            }
+            if (at_end or is_bar) {
+                if (alt_idx > alt_lo) {
+                    if (!first_alt) out.appendSlice(", ") catch return null;
+                    first_alt = false;
+                    out.appendSlice(source[toks[alt_lo].start..toks[alt_idx - 1].end]) catch return null;
+                    out.appendSlice(" => ") catch return null;
+                    const body_slice = source[toks[arm.body_lo].start..toks[arm.body_hi - 1].end];
+                    if (arm.body_is_block) {
+                        out.appendSlice(transformSource(allocator, body_slice)) catch return null;
+                    } else {
+                        // An arm expression that is an assignment (Rust
+                        // allows `pat => x = v`) needs a semicolon inside
+                        // the wrapper block: on the SLA surface assignment
+                        // is a statement, not a block-tail expression.
+                        var adepth_p: i32 = 0;
+                        var adepth_b: i32 = 0;
+                        var adepth_c: i32 = 0;
+                        var is_assign = false;
+                        var ai = arm.body_lo;
+                        while (ai < arm.body_hi) : (ai += 1) {
+                            const atx = tokText(source, toks[ai]);
+                            if (adepth_p == 0 and adepth_b == 0 and adepth_c == 0 and (std.mem.eql(u8, atx, "=") or std.mem.eql(u8, atx, "+=") or std.mem.eql(u8, atx, "-=") or std.mem.eql(u8, atx, "*=") or std.mem.eql(u8, atx, "/=") or std.mem.eql(u8, atx, "%="))) {
+                                is_assign = true;
+                                break;
+                            }
+                            if (std.mem.eql(u8, atx, "(")) adepth_p += 1;
+                            if (std.mem.eql(u8, atx, ")")) adepth_p -= 1;
+                            if (std.mem.eql(u8, atx, "[")) adepth_b += 1;
+                            if (std.mem.eql(u8, atx, "]")) adepth_b -= 1;
+                            if (std.mem.eql(u8, atx, "{")) adepth_c += 1;
+                            if (std.mem.eql(u8, atx, "}")) adepth_c -= 1;
+                        }
+                        out.appendSlice("{ ") catch return null;
+                        out.appendSlice(transformSource(allocator, body_slice)) catch return null;
+                        if (is_assign) out.appendSlice(";") catch return null;
+                        out.appendSlice(" }") catch return null;
+                    }
+                }
+                if (at_end) break;
+                alt_lo = alt_idx + 1;
+            }
+            alt_idx += 1;
+        }
+        out.appendSlice(", ") catch return null;
+    }
+    out.appendSlice("}") catch return null;
+    segs.append("}") catch return null;
+    return body_close + 1;
+}
+
 pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const u8 {
     const toks = tokenize(allocator, source) catch return source;
     var out = std.array_list.Managed(u8).init(allocator);
@@ -648,8 +868,8 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
             continue;
         }
 
-        // ---- raw strings -> escaped string literal (root check rejects these;
-        // this path keeps imported files parseable instead of crashing)
+        // ---- raw strings -> escaped string literal (phase 2: supported at
+        // the root too; validateSource rejects unterminated literals)
         if (t.kind == .raw_string) {
             const content = rawStringContent(source, t);
             var buf = std.array_list.Managed(u8).init(allocator);
@@ -671,6 +891,16 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
         }
 
         if (t.kind == .ident) {
+            // ---- match constructs: expression arms + or-patterns (phase 2)
+            if (std.mem.eql(u8, s, "match")) {
+                const prev_text: []const u8 = if (segs.items.len > 0) segs.items[segs.items.len - 1] else "";
+                if (!std.mem.eql(u8, prev_text, ".")) {
+                    if (emitMatch(allocator, &out, &segs, toks, source, i)) |nxt| {
+                        i = nxt;
+                        continue;
+                    }
+                }
+            }
             // ---- pub: drop (with optional (crate) style scope)
             if (std.mem.eql(u8, s, "pub")) {
                 appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
@@ -950,6 +1180,176 @@ fn failDiagFmt(allocator: std.mem.Allocator, stderr: *std.Io.Writer, file: []con
     return failDiag(stderr, file, line, code, msg);
 }
 
+
+// One or-pattern alternative against the phase-2 pattern set: a qualified
+// variant path (Ident (:: Ident)+) with an optional positional binding
+// list whose elements are plain identifiers or `_`. Appends the binding
+// names (excluding `_`) to key_out for cross-alternative comparison.
+fn validateMatchPatternAlt(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, file: []const u8, stderr: *std.Io.Writer, lo: usize, hi: usize, line: usize, key_out: *std.array_list.Managed(u8)) bool {
+    const first = toks[lo];
+    const ft = tokText(source, first);
+    if (first.kind == .number or first.kind == .string_lit or first.kind == .char_lit) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "literal patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+    }
+    if (first.kind == .punct) {
+        if (std.mem.eql(u8, ft, "(")) {
+            return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "tuple patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+        }
+        if (std.mem.eql(u8, ft, "-")) {
+            return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "literal patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+        }
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "unsupported pattern form in slars match (expected a qualified variant path)");
+    }
+    if (std.mem.eql(u8, ft, "true") or std.mem.eql(u8, ft, "false")) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "literal patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+    }
+    if (std.mem.eql(u8, ft, "_") and hi == lo + 1) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "wildcard pattern _ is not supported in slars match: the shared backend requires every variant to be enumerated");
+    }
+    // Grammar scan: Ident (:: Ident)* [ ( binding, ... ) ] and nothing else.
+    var idx = lo;
+    var qualified = false;
+    if (toks[idx].kind != .ident) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "unsupported pattern form in slars match (expected a qualified variant path)");
+    }
+    idx += 1;
+    while (idx + 1 < hi and textEq(source, toks[idx], "::") and toks[idx + 1].kind == .ident) {
+        qualified = true;
+        idx += 2;
+    }
+    if (idx < hi and textEq(source, toks[idx], "(")) {
+        const close = findMatch(toks, source, idx, "(", ")") orelse return true;
+        // Binding elements: split on top-level commas; each must be one ident.
+        var elo = idx + 1;
+        var eidx = idx + 1;
+        while (true) {
+            const at_end = eidx >= close;
+            const is_comma = !at_end and textEq(source, toks[eidx], ",");
+            if (at_end or is_comma) {
+                if (eidx > elo) {
+                    if (eidx - elo != 1 or toks[elo].kind != .ident) {
+                        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "nested patterns inside a variant pattern are not supported in slars match (positional bindings must be plain names or _)");
+                    }
+                    const bn = tokText(source, toks[elo]);
+                    if (!std.mem.eql(u8, bn, "_")) {
+                        if (key_out.items.len > 0) key_out.append(',') catch {};
+                        key_out.appendSlice(bn) catch {};
+                    }
+                }
+                if (at_end) break;
+                elo = eidx + 1;
+            }
+            eidx += 1;
+        }
+        idx = close + 1;
+    }
+    if (idx != hi) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "unsupported pattern form in slars match (expected a qualified variant path)");
+    }
+    if (!qualified) {
+        return failDiag(stderr, file, line, "SLARS-MATCH-PATTERN", "bare identifier patterns are not supported in slars match (a lone name is a binding or an unqualified variant); use a qualified variant path and enumerate every variant");
+    }
+    _ = allocator;
+    return true;
+}
+
+// Validate every arm of the match construct at `match_idx` (see
+// validateMatchPatternAlt for the pattern set). Guards and range patterns
+// are rejected, as are expression arms starting with a block-like keyword
+// (the shared backend rejects an if/loop as a block tail, so the arm must
+// be written as a block arm). Unparseable shapes are left to the shared
+// parser's own diagnostics.
+fn validateMatchArms(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, file: []const u8, stderr: *std.Io.Writer, match_idx: usize) bool {
+    const body_open = matchBodyOpen(toks, source, match_idx + 1) orelse return true;
+    const body_close = findMatch(toks, source, body_open, "{", "}") orelse return true;
+    var pos = body_open + 1;
+    while (pos < body_close) {
+        if (textEq(source, toks[pos], ",")) {
+            pos += 1;
+            continue;
+        }
+        const arm_line = toks[pos].line;
+        // Locate the arm's '=>' (a '{' at arm level first is a struct pattern).
+        var paren: i32 = 0;
+        var bracket: i32 = 0;
+        var j = pos;
+        var arrow: ?usize = null;
+        var struct_pat = false;
+        while (j < body_close) : (j += 1) {
+            const tx = tokText(source, toks[j]);
+            if (paren == 0 and bracket == 0) {
+                if (std.mem.eql(u8, tx, "=>")) {
+                    arrow = j;
+                    break;
+                }
+                if (std.mem.eql(u8, tx, "{")) {
+                    struct_pat = true;
+                    break;
+                }
+            }
+            if (std.mem.eql(u8, tx, "(")) paren += 1;
+            if (std.mem.eql(u8, tx, ")")) paren -= 1;
+            if (std.mem.eql(u8, tx, "[")) bracket += 1;
+            if (std.mem.eql(u8, tx, "]")) bracket -= 1;
+        }
+        if (struct_pat) {
+            return failDiag(stderr, file, arm_line, "SLARS-MATCH-PATTERN", "struct patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+        }
+        const aidx = arrow orelse return true;
+        // Guards and range patterns anywhere in the pattern range.
+        var k = pos;
+        while (k < aidx) : (k += 1) {
+            const tx = tokText(source, toks[k]);
+            if (toks[k].kind == .ident and std.mem.eql(u8, tx, "if")) {
+                return failDiag(stderr, file, arm_line, "SLARS-MATCH-GUARD", "match guards (pattern if condition) are not supported in slars: the shared backend's match has no fall-through for a failed guard");
+            }
+            if (std.mem.eql(u8, tx, "..") or std.mem.eql(u8, tx, "..=")) {
+                return failDiag(stderr, file, arm_line, "SLARS-MATCH-PATTERN", "range patterns are not supported in slars match (the shared backend's patterns are qualified variant paths only)");
+            }
+        }
+        // Or-pattern alternatives, binding-name consistency across them.
+        var alt_lo = pos;
+        var alt_idx = pos;
+        var pdepth: i32 = 0;
+        var first_key: ?[]const u8 = null;
+        while (true) {
+            const at_end = alt_idx >= aidx;
+            const is_bar = !at_end and pdepth == 0 and textEq(source, toks[alt_idx], "|");
+            if (!at_end) {
+                const tx = tokText(source, toks[alt_idx]);
+                if (std.mem.eql(u8, tx, "(")) pdepth += 1;
+                if (std.mem.eql(u8, tx, ")")) pdepth -= 1;
+            }
+            if (at_end or is_bar) {
+                if (alt_idx > alt_lo) {
+                    var key = std.array_list.Managed(u8).init(allocator);
+                    if (!validateMatchPatternAlt(allocator, toks, source, file, stderr, alt_lo, alt_idx, arm_line, &key)) return false;
+                    if (first_key) |fk| {
+                        if (!std.mem.eql(u8, fk, key.items)) {
+                            return failDiag(stderr, file, arm_line, "SLARS-MATCH-PATTERN", "or-pattern alternatives must bind the same names in the same order in slars match");
+                        }
+                    } else {
+                        first_key = key.items;
+                    }
+                }
+                if (at_end) break;
+                alt_lo = alt_idx + 1;
+            }
+            alt_idx += 1;
+        }
+        // Arm body: block-like expression arms are rejected (see header).
+        const arm = parseMatchArm(toks, source, pos, body_close) orelse return true;
+        if (!arm.body_is_block and arm.body_hi > arm.body_lo) {
+            const bt = tokText(source, toks[arm.body_lo]);
+            if (std.mem.eql(u8, bt, "if") or std.mem.eql(u8, bt, "while") or std.mem.eql(u8, bt, "for") or std.mem.eql(u8, bt, "loop")) {
+                return failDiag(stderr, file, arm_line, "SLARS-MATCH-ARM", "a block-like expression (if/while/for/loop) cannot be a match arm expression in slars; use a block arm: pattern => { ... }");
+            }
+        }
+        pos = arm.next;
+    }
+    return true;
+}
+
 fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []const u8, file: []const u8, stderr: *std.Io.Writer) bool {
     var i: usize = 0;
     var in_for_header = false;
@@ -957,7 +1357,10 @@ fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []con
         const t = toks[i];
         const s = tokText(source, t);
         if (t.kind == .raw_string) {
-            return failDiag(stderr, file, t.line, "SLARS-RAW-STRING", "raw string literals (r#\"...\"#) are not supported in slars phase 1");
+            if (!isWellFormedRawString(s)) {
+                return failDiag(stderr, file, t.line, "SLARS-RAW-STRING", "unterminated or malformed raw string literal (the closing quote must be followed by the same number of '#' as the opening)");
+            }
+            continue;
         }
         if (t.kind == .punct and std.mem.eql(u8, s, "{")) in_for_header = false;
         if (t.kind == .punct and std.mem.eql(u8, s, "..=")) {
@@ -968,6 +1371,21 @@ fn validateSource(allocator: std.mem.Allocator, toks: []const Tok, source: []con
         }
         if (t.kind != .ident) continue;
         if (std.mem.eql(u8, s, "for")) in_for_header = true;
+        if (std.mem.eql(u8, s, "match")) {
+            const prev_ok = i == 0 or !textEq(source, toks[i - 1], ".");
+            if (prev_ok and !validateMatchArms(allocator, toks, source, file, stderr, i)) return false;
+        }
+        if (std.mem.eql(u8, s, "b") or std.mem.eql(u8, s, "br")) {
+            // Byte string literals: the ident runs directly into a quote
+            // (b"...") or into hashes then a quote (br#"..."#).
+            if (t.end < source.len and (source[t.end] == '"' or source[t.end] == '#')) {
+                var q = t.end;
+                while (q < source.len and source[q] == '#') q += 1;
+                if (q < source.len and source[q] == '"') {
+                    return failDiag(stderr, file, t.line, "SLARS-BYTE-STRING", "byte string literals are not supported in slars: the shared surface has no byte-string type; use a string literal or an explicit byte array");
+                }
+            }
+        }
         if (std.mem.eql(u8, s, "macro_rules")) {
             return failDiag(stderr, file, t.line, "SLARS-MACRO-DEF", "macro_rules! definitions are rejected in slars phase 1 (the macro system is out of scope; use the shipped slars standard macro library)");
         }
