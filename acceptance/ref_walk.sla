@@ -1,0 +1,310 @@
+// ref_walk.sla — SLA reference for the slars acceptance walker.
+// Acceptance walker: walks a tree-sitter AST of ./input.src and prints
+//   total: <node count>
+//   <node type>: <count>     (first-encounter order)
+//   decl: <name>              (functions, methods, arrow-bound variables)
+//   sexp: <first 400 bytes of the root s-expression>
+// Language ("typescript"/"tsx") comes from TS_WALK_LANG (default
+// typescript). Distinct exit codes per failing stage (2..14).
+@import "sa_std/tree_sitter.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "sa_std/env.sai"
+@import "byteseq.sa"
+@import "append.sa"
+
+struct Walk {
+    total: u64,
+    ntypes: u64,
+    name_slots: [u8; 8192],
+    name_lens: [u64; 128],
+    counts: [u64; 128],
+    decls: [u8; 8192],
+    decl_len: u64,
+}
+
+fn emit_total_pre() {
+    let b = [0u8; 7];
+    b[0] = 116;
+    b[1] = 111;
+    b[2] = 116;
+    b[3] = 97;
+    b[4] = 108;
+    b[5] = 58;
+    b[6] = 32;
+    sa_print_bytes(&b, 7);
+}
+
+fn emit_colon() {
+    let b = [0u8; 2];
+    b[0] = 58;
+    b[1] = 32;
+    sa_print_bytes(&b, 2);
+}
+
+fn emit_sexp_pre() {
+    let b = [0u8; 6];
+    b[0] = 115;
+    b[1] = 101;
+    b[2] = 120;
+    b[3] = 112;
+    b[4] = 58;
+    b[5] = 32;
+    sa_print_bytes(&b, 6);
+}
+
+fn print_u8(b: u8) {
+    let tmp = [0u8; 1];
+    tmp[0] = b;
+    sa_print_bytes(&tmp, 1);
+}
+
+fn print_u64(v: u64) {
+    let digits = [0u8; 20];
+    let n: u64 = 0;
+    let x = v;
+    if x == 0 {
+        digits[0] = 48;
+        n = 1;
+    } else {
+        let rev = [0u8; 20];
+        let m: u64 = 0;
+        while x > 0 {
+            rev[m] = ((x % 10) + 48) as u8;
+            m = m + 1;
+            x = x / 10;
+        }
+        while m > 0 {
+            digits[n] = rev[m - 1];
+            n = n + 1;
+            m = m - 1;
+        }
+    };
+    sa_print_bytes(&digits, n);
+}
+
+fn type_is(node: u64, lit: ptr, lit_len: u64) -> bool {
+    let buf = [0u8; 64];
+    let blen: u64 = 0;
+    if sa_ts_node_type(node, &buf, 64, &blen) != 0 {
+        return false;
+    };
+    let slot = [0u64; 1];
+    BYTES_EQ(&slot, &buf, blen, lit, lit_len);
+    return slot[0] == 1;
+}
+
+fn harvest_name(w: &Walk, node: u64) {
+    let name_node: u64 = 0;
+    if sa_ts_node_child_by_field(node, STR_PTR("name"), STR_LEN("name"), &name_node) != 0 {
+        return;
+    };
+    if name_node == 0 {
+        return;
+    };
+    let nbuf = [0u8; 128];
+    let nlen: u64 = 0;
+    if sa_ts_node_text(name_node, &nbuf, 128, &nlen) == 0 {
+        let pre = [0u8; 6];
+        pre[0] = 100;
+        pre[1] = 101;
+        pre[2] = 99;
+        pre[3] = 108;
+        pre[4] = 58;
+        pre[5] = 32;
+        let j: u64 = 0;
+        while j < 6 {
+            j = j + 1;
+            w.decls[w.decl_len] = pre[j - 1];
+            w.decl_len = w.decl_len + 1;
+        }
+        let q: u64 = 0;
+        while q < nlen {
+            q = q + 1;
+            w.decls[w.decl_len] = nbuf[q - 1];
+            w.decl_len = w.decl_len + 1;
+        }
+        w.decls[w.decl_len] = 10;
+        w.decl_len = w.decl_len + 1;
+    };
+    sa_ts_node_free(name_node);
+}
+
+fn walk_node(w: &Walk, node: u64) {
+    w.total = w.total + 1;
+    let tbuf = [0u8; 64];
+    let tlen: u64 = 0;
+    if sa_ts_node_type(node, &tbuf, 64, &tlen) != 0 {
+        return;
+    };
+    let k: u64 = 0;
+    let found: u64 = 0;
+    while k < w.ntypes {
+        k = k + 1;
+        let idx = k - 1;
+        if found == 0 && w.name_lens[idx] == tlen {
+            let same: u64 = 1;
+            let j: u64 = 0;
+            while j < tlen {
+                j = j + 1;
+                if w.name_slots[idx * 64 + (j - 1)] != tbuf[j - 1] {
+                    same = 0;
+                };
+            }
+            if same == 1 {
+                w.counts[idx] = w.counts[idx] + 1;
+                found = 1;
+            };
+        };
+    }
+    if found == 0 && w.ntypes < 128 {
+        let idx = w.ntypes;
+        let j: u64 = 0;
+        while j < tlen {
+            j = j + 1;
+            w.name_slots[idx * 64 + (j - 1)] = tbuf[j - 1];
+        }
+        w.name_lens[idx] = tlen;
+        w.counts[idx] = 1;
+        w.ntypes = w.ntypes + 1;
+    };
+    if type_is(node, STR_PTR("function_declaration"), STR_LEN("function_declaration")) {
+        harvest_name(w, node);
+    };
+    if type_is(node, STR_PTR("method_definition"), STR_LEN("method_definition")) {
+        harvest_name(w, node);
+    };
+    if type_is(node, STR_PTR("variable_declarator"), STR_LEN("variable_declarator")) {
+        let vnode: u64 = 0;
+        if sa_ts_node_child_by_field(node, STR_PTR("value"), STR_LEN("value"), &vnode) == 0 && vnode != 0 {
+            if type_is(vnode, STR_PTR("arrow_function"), STR_LEN("arrow_function")) {
+                harvest_name(w, node);
+            };
+            if type_is(vnode, STR_PTR("function_expression"), STR_LEN("function_expression")) {
+                harvest_name(w, node);
+            };
+            sa_ts_node_free(vnode);
+        };
+    };
+    let cnt: u32 = 0;
+    if sa_ts_node_child_count(node, &cnt) != 0 {
+        return;
+    };
+    let i: u32 = 0;
+    while i < cnt {
+        i = i + 1;
+        let child: u64 = 0;
+        if sa_ts_node_child(node, i - 1, 0, &child) == 0 && child != 0 {
+            walk_node(w, child);
+            sa_ts_node_free(child);
+        };
+    }
+}
+
+fn main() -> i32 {
+    if sa_ts_available() != 1 {
+        return 2;
+    };
+    let total: u64 = 0;
+    if sa_std_fs_len(STR_PTR("input.src"), STR_LEN("input.src"), &total) != 0 {
+        return 3;
+    };
+    if total > 65536 {
+        return 14;
+    };
+    let src = [0u8; 65536];
+    let fh: u64 = 0;
+    if sa_std_fs_open_read(STR_PTR("input.src"), STR_LEN("input.src"), &fh) != 0 {
+        return 4;
+    };
+    let read_n: u64 = 0;
+    let rst: i32 = sa_std_fs_file_read(fh, &src, total, &read_n);
+    sa_std_close(fh);
+    if rst != 0 {
+        return 5;
+    };
+    if read_n != total {
+        return 6;
+    };
+    let parser: u64 = 0;
+    if sa_ts_parser_new(&parser) != 0 {
+        return 7;
+    };
+    let h: u64 = sa_env_get(STR_PTR("TS_WALK_LANG"), STR_LEN("TS_WALK_LANG"));
+    let lst: i32 = 0;
+    if h != 0 {
+        let lp: ptr = sa_env_buffer_data(h);
+        let llen: u64 = sa_env_buffer_len(h);
+        lst = sa_ts_parser_set_language(parser, lp, llen);
+        sa_env_buffer_free(h);
+    } else {
+        lst = sa_ts_parser_set_language(parser, STR_PTR("typescript"), STR_LEN("typescript"));
+    };
+    if lst != 0 {
+        sa_ts_parser_free(parser);
+        return 8;
+    };
+    let tree: u64 = 0;
+    if sa_ts_parse(parser, &src, total, &tree) != 0 {
+        sa_ts_parser_free(parser);
+        return 9;
+    };
+    let root: u64 = 0;
+    if sa_ts_tree_root(tree, &root) != 0 {
+        sa_ts_tree_free(tree);
+        sa_ts_parser_free(parser);
+        return 11;
+    };
+    let w = Walk {
+        total: 0,
+        ntypes: 0,
+        name_slots: [0u8; 8192],
+        name_lens: [0u64; 128],
+        counts: [0u64; 128],
+        decls: [0u8; 8192],
+        decl_len: 0,
+    };
+    walk_node(&w, root);
+    sa_ts_node_free(root);
+    emit_total_pre();
+    print_u64(w.total);
+    print_u8(10);
+    let k: u64 = 0;
+    while k < w.ntypes {
+        k = k + 1;
+        let idx = k - 1;
+        let j: u64 = 0;
+        while j < w.name_lens[idx] {
+            j = j + 1;
+            print_u8(w.name_slots[idx * 64 + (j - 1)]);
+        }
+        emit_colon();
+        print_u64(w.counts[idx]);
+        print_u8(10);
+    }
+    let d: u64 = 0;
+    while d < w.decl_len {
+        d = d + 1;
+        print_u8(w.decls[d - 1]);
+    }
+    let sbuf = [0u8; 32768];
+    let slen: u64 = 0;
+    if sa_ts_tree_sexp(tree, &sbuf, 32768, &slen) == 0 {
+        emit_sexp_pre();
+        let take: u64 = slen;
+        if take > 400 {
+            take = 400;
+        };
+        let s: u64 = 0;
+        while s < take {
+            s = s + 1;
+            print_u8(sbuf[s - 1]);
+        }
+        print_u8(10);
+    };
+    sa_ts_tree_free(tree);
+    sa_ts_parser_free(parser);
+    return 0;
+}

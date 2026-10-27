@@ -1,0 +1,56 @@
+// BYTES_EQ %slot, %a_ptr, %a_len, %b_ptr, %b_len
+// Byte-wise equality on (ptr, len) pairs, storing 1/0 into *%slot (a u64
+// slot whose address comes from .sla, e.g. &slot_array). Adapted from
+// codexmini's X_STR_EQ (slicex.sa) to the pointer-out style, because .sla
+// codegen cannot take a value-out register from a plain .sa macro.
+// Expand at most once per function body (labels are fixed).
+[MACRO] BYTES_EQ %slot, %a_ptr, %a_len, %b_ptr, %b_len
+    same_len_beq = eq %a_len, %b_len
+    idx_slot_beq = stack_alloc 8
+    store idx_slot_beq+0, 0 as u64
+    br same_len_beq -> L_BEQ_HEAD, L_BEQ_NE
+L_BEQ_LOOP:
+    jmp L_BEQ_HEAD
+L_BEQ_HEAD:
+    idx_beq = load idx_slot_beq+0 as u64
+    done_beq = eq idx_beq, %a_len
+    br done_beq -> L_BEQ_TRUE, L_BEQ_BODY
+L_BEQ_BODY:
+    a_ip_beq = ptr_add %a_ptr, idx_beq
+    b_ip_beq = ptr_add %b_ptr, idx_beq
+    a_byte_beq = load a_ip_beq+0 as u8
+    b_byte_beq = load b_ip_beq+0 as u8
+    bytes_eq_beq = eq a_byte_beq, b_byte_beq
+    !a_byte_beq
+    !b_byte_beq
+    !a_ip_beq
+    !b_ip_beq
+    br bytes_eq_beq -> L_BEQ_NEXT, L_BEQ_FALSE
+L_BEQ_NEXT:
+    next_idx_beq = add idx_beq, 1
+    store idx_slot_beq+0, next_idx_beq as u64
+    !idx_beq
+    !done_beq
+    !bytes_eq_beq
+    !next_idx_beq
+    jmp L_BEQ_HEAD
+L_BEQ_TRUE:
+    one_beq = add 0, 1
+    store %slot+0, one_beq as u64
+    !one_beq
+    !same_len_beq
+    jmp L_BEQ_END
+L_BEQ_FALSE:
+    zero_beq = add 0, 0
+    store %slot+0, zero_beq as u64
+    !zero_beq
+    !bytes_eq_beq
+    !same_len_beq
+    jmp L_BEQ_END
+L_BEQ_NE:
+    zero2_beq = add 0, 0
+    store %slot+0, zero2_beq as u64
+    !zero2_beq
+    !same_len_beq
+L_BEQ_END:
+[END_MACRO]

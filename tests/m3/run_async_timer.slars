@@ -1,0 +1,19 @@
+@import "sa_std/timer.sla"
+@import "sa_std/async.sla"
+
+async fn five() -> i32 {
+    return 5;
+}
+
+fn main() -> i32 {
+    let r = sched_block_on_timeout(five(), 5000);
+    println!("{}", r);
+    let a = timer_now_ns();
+    let b = timer_now_ns();
+    if b >= a {
+        println!("1");
+    } else {
+        println!("0");
+    };
+    return 0;
+}

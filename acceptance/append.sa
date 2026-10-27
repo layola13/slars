@@ -1,0 +1,33 @@
+// APPEND_BYTES %acc_ptr, %cur_len, %src_ptr, %n
+// Copies %n bytes from %src_ptr to %acc_ptr + %cur_len. The caller owns
+// length bookkeeping (the .sla side updates its len field). Pointer-out
+// macro style like BYTES_EQ; expand at most once per function body
+// (labels are fixed).
+[MACRO] APPEND_BYTES %acc_ptr, %cur_len, %src_ptr, %n
+    idx_slot_apd = stack_alloc 8
+    store idx_slot_apd+0, 0 as u64
+    jmp L_APD_HEAD
+L_APD_LOOP:
+    jmp L_APD_HEAD
+L_APD_HEAD:
+    idx_apd = load idx_slot_apd+0 as u64
+    done_apd = eq idx_apd, %n
+    br done_apd -> L_APD_END, L_APD_BODY
+L_APD_BODY:
+    dst_off_apd = add %cur_len, idx_apd
+    dst_ip_apd = ptr_add %acc_ptr, dst_off_apd
+    src_ip_apd = ptr_add %src_ptr, idx_apd
+    byte_apd = load src_ip_apd+0 as u8
+    store dst_ip_apd+0, byte_apd as u8
+    !byte_apd
+    !dst_ip_apd
+    !src_ip_apd
+    !dst_off_apd
+    next_idx_apd = add idx_apd, 1
+    store idx_slot_apd+0, next_idx_apd as u64
+    !idx_apd
+    !done_apd
+    !next_idx_apd
+    jmp L_APD_HEAD
+L_APD_END:
+[END_MACRO]
