@@ -1,0 +1,28 @@
+@import "sa_std/plugin_http_server.sla"
+@import "sa_std/plugin_http_server.sa"
+@import "sa_std/http_server.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+
+// AG6 minimal repro: SA_HTTP_SERVER_ACCEPT_V2 in isolation.
+// The macro's leading PollResult output is assigned by `alloc` inside
+// the expansion; the SLA macro-call lowering passes the slot's loaded
+// (NULL) value instead, so `poll` stays NULL and the very first
+// POLL_RESULT_IS_READY dereferences NULL. Expected at this HEAD:
+// segfault (rc 139) before any output. If a future compiler fixes the
+// lowering, this prints pendings: 1 and exits 0.
+
+fn main() -> i32 {
+    let srv: ptr = PTR_NULL();
+    if sa_http_server_new_v2(&srv) != 0 { return 2; };
+    if sa_http_server_start_v2(srv, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 18099) != 0 { return 3; };
+    let poll: ptr = PTR_NULL();
+    SA_HTTP_SERVER_ACCEPT_V2(poll, srv, 0);
+    let rdy: u64 = 0;
+    POLL_RESULT_IS_READY(rdy, poll);
+    println!("pendings:");
+    if rdy == 0 { println!("1"); };
+    println!("accept_v2 repro ok");
+    return 0;
+}

@@ -1,0 +1,21 @@
+@import "wrap_poll.sla"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+
+// AG6 probe root: if the wrapper path preserves macro pointer outputs,
+// this prints ready=1 value=777 and exits 0.
+
+fn main() -> i32 {
+    let p = wp_make_ok_poll();
+    if p == PTR_NULL() { return 2; };
+    let r = wp_poll_ready(p);
+    println!("wrap_ready:");
+    println!("{}", r);
+    if r != 1 { return 3; };
+    let v = wp_poll_value(p);
+    println!("wrap_value:");
+    println!("{}", v);
+    if v != 777 { return 4; };
+    println!("wrap probe ok");
+    return 0;
+}

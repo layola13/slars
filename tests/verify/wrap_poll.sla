@@ -1,0 +1,25 @@
+@import "sa_std/plugin_async.sa"
+@import "sa_std/core/future.sa"
+@import "sa_std/ptr.sa"
+
+// AG6 probe: do SA-macro leading pointer outputs survive when the macro
+// call site is inside an imported .sla function (the genImportedMacroCall
+// path), as opposed to a root file? Root .slars calls these wrappers.
+
+fn wp_make_ok_poll() -> ptr {
+    let p: ptr = PTR_NULL();
+    PLUGIN_ASYNC_POLL_RESULT(p, 0, 1, 777);
+    return p;
+}
+
+fn wp_poll_ready(p: ptr) -> u64 {
+    let r: u64 = 0;
+    POLL_RESULT_IS_READY(r, p);
+    return r;
+}
+
+fn wp_poll_value(p: ptr) -> u64 {
+    let v: u64 = 0;
+    POLL_RESULT_OK_VALUE(v, p);
+    return v;
+}

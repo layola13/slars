@@ -1,0 +1,48 @@
+@import "sa_std/plugin_http_server.sla"
+@import "sa_std/plugin_http_server.sa"
+@import "sa_std/http_server.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+
+// AG6 verify: plugin_http_server std surface, semantic drive.
+//
+// FACADE VERDICT (DESIGN SS11.1): the SA_HTTP_SERVER_*_V2 macro facade is
+// NOT drivable from SLA/slars surface code at this HEAD --
+// SA_HTTP_SERVER_ACCEPT_V2's leading PollResult pointer output is lost
+// by the macro-call lowering (repro: repro_accept_v2.slars segfaults on
+// the NULL poll), and SA_HTTP_SERVER_RESP_SEND_V2 traps at build with
+// CapabilityMismatch for both u32 and i32 consumer variables. The
+// minimal repros live in repro_plugin_facades.slars / .sla.
+//
+// This program therefore drives the same std surface through the v2
+// externs the facade wraps (the pattern of sla demo
+// demos/cxu/02_http_ws_sse): start a server on 127.0.0.1:18097, accept
+// one real request (the runner curls /hello), send a fixed JSON body,
+// free everything, print the ok line. Distinct return codes per step.
+
+fn main() -> i32 {
+    let srv: ptr = PTR_NULL();
+    if sa_http_server_new_v2(&srv) != 0 { return 2; };
+    if sa_http_server_start_v2(srv, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 18097) != 0 { return 3; };
+
+    let mut req: ptr = PTR_NULL();
+    let mut got = false;
+    let mut spins: u64 = 0;
+    while got != true {
+        if sa_http_server_accept_v2(srv, 2000, &req) == 0 {
+            got = true;
+        };
+        spins = spins + 1;
+        if spins > 30 { return 4; };
+    }
+    let resp: ptr = PTR_NULL();
+    if sa_http_server_resp_new_v2(req, 200, &resp) != 0 { return 5; };
+    let body = "{\"hello\":\"slars-plugin-http\"}";
+    if sa_http_server_resp_send_v2(resp, STR_PTR(body), STR_LEN(body), 5000) != 0 { return 6; };
+    sa_http_server_resp_free_v2(resp);
+    sa_http_server_req_free_v2(req);
+    sa_http_server_free_v2(srv);
+    println!("plugin_http_server ok");
+    return 0;
+}

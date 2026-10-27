@@ -1,0 +1,96 @@
+@import "sa_std/plugin_async.sla"
+@import "sa_std/plugin_async.sa"
+@import "sa_std/plugin_http_async.sa"
+@import "sa_std/plugin_http_server.sa"
+@import "sa_std/http_server.sai"
+@import "sa_std/http_client.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "byteseq.sa"
+
+// AG6 verify: plugin_async std surface, semantic drive.
+//
+// FACADE VERDICT (DESIGN SS11.1): the PollResult adapter macros
+// (PLUGIN_ASYNC_POLL_RESULT, SA_HTTP_ASYNC_POLL_V2) and the PluginAsyncOp
+// macros are NOT drivable from SLA/slars surface code at this HEAD --
+// their leading pointer outputs are lost by the macro-call lowering, so
+// the poll/op pointers stay NULL (repro pack: repro_plugin_facades.*
+// segfaults / returns NULL from both .slars and .sla roots, and from an
+// imported-.sla wrapper). The op state machine itself is sound at the SA
+// level (sci plugin-imported-macro seed tests drive it from hand-written
+// SA); the loss is in the SLA macro-call lowering, not the std design.
+//
+// This program drives the same async HTTP surface through the v2 externs
+// the adapter wraps: an in-process server on 127.0.0.1:18098 plus an
+// async client GET -- start the request without blocking, serve it,
+// poll the op to readiness, take the response, verify status and body.
+// Distinct return codes per step.
+
+fn bytes_is(p_ptr: ptr, p_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    let slot = [0u64; 1];
+    BYTES_EQ(&slot, p_ptr, p_len, lit_ptr, lit_len);
+    return slot[0] == 1;
+}
+
+fn main() -> i32 {
+    // --- server side up ---
+    let srv: ptr = PTR_NULL();
+    if sa_http_server_new_v2(&srv) != 0 { return 2; };
+    if sa_http_server_start_v2(srv, STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 18098) != 0 { return 3; };
+
+    // --- async client: build + start a GET, do not block on it ---
+    let cli: ptr = PTR_NULL();
+    if sa_http_client_new_v2(0, STR_PTR(""), 0, &cli) != 0 { return 4; };
+    let url = "http://127.0.0.1:18098/async";
+    let req: ptr = PTR_NULL();
+    if sa_http_client_req_new_v2(cli, 1, STR_PTR(url), STR_LEN(url), &req) != 0 { return 5; };
+    let op: ptr = PTR_NULL();
+    if sa_http_client_req_send_async_v2(req, &op) != 0 { return 6; };
+
+    // --- serve the request the async client just made ---
+    let mut sreq: ptr = PTR_NULL();
+    let mut got = false;
+    let mut spins: u64 = 0;
+    while got != true {
+        if sa_http_server_accept_v2(srv, 2000, &sreq) == 0 {
+            got = true;
+        };
+        spins = spins + 1;
+        if spins > 30 { return 7; };
+    }
+    let sresp: ptr = PTR_NULL();
+    if sa_http_server_resp_new_v2(sreq, 200, &sresp) != 0 { return 8; };
+    let body = "{\"async\":\"plugin-poll\"}";
+    if sa_http_server_resp_send_v2(sresp, STR_PTR(body), STR_LEN(body), 5000) != 0 { return 9; };
+    sa_http_server_resp_free_v2(sresp);
+    sa_http_server_req_free_v2(sreq);
+    sa_http_server_free_v2(srv);
+
+    // --- poll the async op to readiness, then take the response ---
+    let mut ready: u32 = 0;
+    let mut polls: u64 = 0;
+    let mut done = false;
+    while done != true {
+        if sa_http_client_async_poll_v2(op, 2000, &ready) != 0 { return 10; };
+        if ready == 1 { done = true; };
+        polls = polls + 1;
+        if polls > 30 { return 11; };
+    }
+    let resp: ptr = PTR_NULL();
+    if sa_http_client_async_take_response_v2(op, &resp) != 0 { return 12; };
+    let status = sa_http_client_resp_status(resp);
+    println!("async_http_status:");
+    println!("{}", status);
+    if status != 200 { return 13; };
+    let b_ptr: ptr = PTR_NULL();
+    let b_len: u64 = 0;
+    if sa_http_client_resp_body_slice(resp, &b_ptr, &b_len) != 0 { return 14; };
+    if !bytes_is(b_ptr, b_len, STR_PTR(body), STR_LEN(body)) { return 15; };
+    sa_http_client_resp_free(resp);
+    sa_http_client_async_free_v2(op);
+    sa_http_client_req_free(req);
+    sa_http_client_free(cli);
+    println!("plugin_async http ok");
+    return 0;
+}

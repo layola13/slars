@@ -1,0 +1,87 @@
+// AG6 REPRO: pure-SLA twin of repro_plugin_facades.slars (println lines
+// stripped; return codes carry the assertions). EXPECTED at this HEAD:
+// builds, then segfaults (rc 139) identically to the .slars root -- the
+// pointer-output loss is in the shared SLA macro-call lowering, not in
+// the slars transform. See DESIGN SS11.1.
+@import "sa_std/plugin_async.sla"
+@import "sa_std/plugin_async.sa"
+@import "sa_std/plugin_http_async.sa"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+
+// AG6 verify: plugin_async.sla semantic drive (pure, deterministic).
+// NOTE (AG6 finding, DESIGN SS11.1): the .sla surface alone does NOT make
+// the wrapped .sa macros callable from a root file (Undefined call); the
+// consumer must also import the underlying .sa directly -- exactly what
+// production SLA code does. Both imports are kept here on purpose.
+// Exercises the PluginAsyncOp state machine macros and the
+// PLUGIN_ASYNC_POLL_RESULT status->PollResult mapping from a .sla root.
+// Distinct return codes per failed assertion; prints evidence values.
+
+fn main() -> i32 {
+    // --- op lifecycle: NEW -> PENDING -> READY -> FAILED ---
+    let anchor = [0u8; 4];
+    let op: ptr = PTR_NULL();
+    PLUGIN_ASYNC_OP_NEW(op, &anchor, 5000);
+    let st: u64 = 0;
+    PLUGIN_ASYNC_OP_STATE(st, op);
+    if st != 0 { return 2; };
+    let done: u64 = 0;
+    PLUGIN_ASYNC_OP_IS_DONE(done, op);
+    if done != 0 { return 3; };
+    PLUGIN_ASYNC_OP_SET_READY(op, &anchor);
+    PLUGIN_ASYNC_OP_STATE(st, op);
+    if st != 1 { return 4; };
+    PLUGIN_ASYNC_OP_IS_DONE(done, op);
+    if done != 1 { return 5; };
+    PLUGIN_ASYNC_OP_SET_ERROR(op, 6);
+    PLUGIN_ASYNC_OP_STATE(st, op);
+    if st != 2 { return 6; };
+
+    // --- cancel path on a second op ---
+    let op2: ptr = PTR_NULL();
+    PLUGIN_ASYNC_OP_NEW(op2, &anchor, 1000);
+    PLUGIN_ASYNC_OP_CANCEL(op2);
+    PLUGIN_ASYNC_OP_STATE(st, op2);
+    if st != 3 { return 7; };
+    PLUGIN_ASYNC_OP_IS_DONE(done, op2);
+    if done != 1 { return 8; };
+
+    // --- PLUGIN_ASYNC_POLL_RESULT mapping ---
+    // (a) would_block status, not ready -> Pending
+    let pa: ptr = PTR_NULL();
+    PLUGIN_ASYNC_POLL_RESULT(pa, 1, 0, 0);
+    let rdy: u64 = 0;
+    POLL_RESULT_IS_READY(rdy, pa);
+    if rdy != 0 { return 9; };
+    // (b) ok status but not ready -> Pending
+    let pb: ptr = PTR_NULL();
+    PLUGIN_ASYNC_POLL_RESULT(pb, 0, 0, 0);
+    POLL_RESULT_IS_READY(rdy, pb);
+    if rdy != 0 { return 10; };
+    // (c) ok + ready + value -> Ready(Ok(777))
+    let pc: ptr = PTR_NULL();
+    PLUGIN_ASYNC_POLL_RESULT(pc, 0, 1, 777);
+    POLL_RESULT_IS_READY(rdy, pc);
+    if rdy != 1 { return 11; };
+    let isok: u64 = 0;
+    POLL_RESULT_IS_OK(isok, pc);
+    if isok != 1 { return 12; };
+    let val: u64 = 0;
+    POLL_RESULT_OK_VALUE(val, pc);
+    if val != 777 { return 13; };
+    // (d) io_error status -> Ready(Err(6))
+    let pd: ptr = PTR_NULL();
+    PLUGIN_ASYNC_POLL_RESULT(pd, 6, 0, 0);
+    POLL_RESULT_IS_READY(rdy, pd);
+    if rdy != 1 { return 14; };
+    let iserr: u64 = 0;
+    POLL_RESULT_IS_ERR(iserr, pd);
+    if iserr != 1 { return 15; };
+    let ev: u64 = 0;
+    POLL_RESULT_ERR_VALUE(ev, pd);
+    if ev != 6 { return 16; };
+
+    return 0;
+}

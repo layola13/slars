@@ -1,0 +1,20 @@
+@import "sa_std/plugin_http_server.sa"
+@import "sa_std/http_server.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+
+// AG6 minimal repro: SA_HTTP_SERVER_RESP_SEND_V2 build trap.
+// The macro declares its status output u32 while the wrapped extern
+// sa_http_server_resp_send_v2 returns u32-typed values through an i32
+// call contract in the generated SA; from SLA surface code build-exe
+// fails SAB verification with CapabilityMismatch at the expansion's
+// call site, for both u32 and i32 consumer variables. Never runs.
+
+fn main() -> i32 {
+    let resp: ptr = PTR_NULL();
+    let body = "x";
+    let st: u32 = 0;
+    SA_HTTP_SERVER_RESP_SEND_V2(st, resp, STR_PTR(body), STR_LEN(body), 1000);
+    if st != 0 { return 2; };
+    return 0;
+}

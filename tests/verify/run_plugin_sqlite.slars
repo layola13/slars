@@ -1,0 +1,135 @@
+@import "plugin/node/node_extra.sai"
+@import "sa_std/plugin_sqlite.sla"
+@import "sa_std/plugin_sqlite.sa"
+@import "sa_std/encoding/json.sai"
+@import "sa_std/string.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/io/print.sai"
+@import "byteseq.sa"
+
+// AG6 verify: plugin_sqlite std surface, semantic drive.
+//
+// FACADE VERDICT (DESIGN SS11.1): the SA_SQLITE_* macro facade is only
+// PARTLY drivable from SLA/slars surface code at this HEAD.
+// SA_SQLITE_OPEN and SA_SQLITE_PREPARE trap at build with
+// RegisterRedefinition (`db = 0` / `stmt = 0`: the macros assign their
+// leading outputs a literal 0 first, which collides with the SLA
+// frontend's materialized initializer -- the identical shape ships in
+// production licenseStore.sla sa_sqlite_open). Those two steps below use
+// the raw node-plugin externs (the pattern of sla demo
+// demos/cxu/03_store_session). EXEC / BIND_TEXT / BIND_INT / STEP_JSON /
+// QUERY_JSON / FINALIZE / CLOSE build and run from surface code through
+// one-macro-per-helper wrappers (the production stores pattern), with
+// pointer outputs consumed inside the helper that receives them.
+//
+// Flow: open a real database file, create a table, insert one row via
+// prepare/bind/step, one via exec, read both back via query_json and
+// verify the values through sa_std's JSON surface. The runner also
+// cross-checks the file with python3 sqlite3. Distinct return codes.
+
+fn bytes_is(p_ptr: ptr, p_len: u64, lit_ptr: ptr, lit_len: u64) -> bool {
+    let slot = [0u64; 1];
+    BYTES_EQ(&slot, p_ptr, p_len, lit_ptr, lit_len);
+    return slot[0] == 1;
+}
+
+fn sq_exec(db: u64, sql: ptr, sql_len: u64) -> u64 {
+    let st: u64 = 0;
+    SA_SQLITE_EXEC(st, db, sql, sql_len);
+    return st;
+}
+
+fn sq_bind_text(stmt: u64, idx: u64, v: ptr, v_len: u64) -> u64 {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_TEXT(st, stmt, idx, v, v_len);
+    return st;
+}
+
+fn sq_bind_int(stmt: u64, idx: u64, v: u64) -> u64 {
+    let st: u64 = 0;
+    SA_SQLITE_BIND_INT(st, stmt, idx, v);
+    return st;
+}
+
+fn sq_step_insert(stmt: u64) -> u64 {
+    let st: u64 = 0;
+    let ready: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_STEP_JSON(st, ready, rp, rl, stmt);
+    return st;
+}
+
+fn sq_finalize(stmt: u64) -> u64 {
+    let st: u64 = 0;
+    SA_SQLITE_FINALIZE(st, stmt);
+    return st;
+}
+
+// Runs a query and parses the JSON result inside the helper (the macro's
+// pointer output is consumed in the same function that receives it).
+// Returns the JSON doc handle, 0 on any failure.
+fn sq_query_doc(db: u64, sql: ptr, sql_len: u64) -> u64 {
+    let st: u64 = 0;
+    let rp: ptr = PTR_NULL();
+    let rl: u64 = 0;
+    SA_SQLITE_QUERY_JSON(st, rp, rl, db, sql, sql_len);
+    if st != 0 { return 0; };
+    if rl == 0 { return 0; };
+    return sa_json_parse(rp, rl);
+}
+
+fn sq_close(db: u64) -> u64 {
+    let st: u64 = 0;
+    SA_SQLITE_CLOSE(st, db);
+    return st;
+}
+
+fn main() -> i32 {
+    let path = "verify_sqlite.db";
+    let mut db: u64 = 0;
+    if sa_node_plugin_sqlite_open(STR_PTR(path), STR_LEN(path), &db) != 0 { return 2; };
+    if db == 0 { return 3; };
+
+    let ddl = "CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v INTEGER NOT NULL)";
+    if sq_exec(db, STR_PTR(ddl), STR_LEN(ddl)) != 0 { return 4; };
+    let wipe = "DELETE FROM kv";
+    if sq_exec(db, STR_PTR(wipe), STR_LEN(wipe)) != 0 { return 5; };
+
+    // insert row 1 via prepare (raw extern) / bind + step (facade)
+    let ins = "INSERT INTO kv(k, v) VALUES(?1, ?2)";
+    let mut stmt: u64 = 0;
+    if sa_node_plugin_sqlite_prepare(db, STR_PTR(ins), STR_LEN(ins), &stmt) != 0 { return 6; };
+    if stmt == 0 { return 7; };
+    let key = "answer";
+    if sq_bind_text(stmt, 1, STR_PTR(key), STR_LEN(key)) != 0 { return 8; };
+    if sq_bind_int(stmt, 2, 42) != 0 { return 9; };
+    if sq_step_insert(stmt) != 0 { return 10; };
+    if sq_finalize(stmt) != 0 { return 11; };
+
+    // insert row 2 via exec
+    let ins2 = "INSERT INTO kv(k, v) VALUES('other', 7)";
+    if sq_exec(db, STR_PTR(ins2), STR_LEN(ins2)) != 0 { return 12; };
+
+    // read back ordered by k: row0 = answer/42, row1 = other/7
+    let q = "SELECT k, v FROM kv ORDER BY k";
+    let rows = sq_query_doc(db, STR_PTR(q), STR_LEN(q));
+    if rows == 0 { return 13; };
+    let mut n: u64 = 0;
+    if sa_json_value_count(rows, &n) != 0 { return 14; };
+    if n != 2 { return 15; };
+    let mut row0: u64 = 0;
+    if sa_json_array_get(rows, 0, &row0) != 0 { return 16; };
+    let k_ptr: ptr = PTR_NULL();
+    let k_len: u64 = 0;
+    if sa_json_object_get_string(row0, STR_PTR("k"), STR_LEN("k"), &k_ptr, &k_len) != 0 { return 17; };
+    if !bytes_is(k_ptr, k_len, STR_PTR("answer"), STR_LEN("answer")) { return 18; };
+    let mut v0: i64 = 0;
+    if sa_json_object_get_i64(row0, STR_PTR("v"), STR_LEN("v"), &v0) != 0 { return 19; };
+    if v0 != 42 { return 20; };
+    sa_json_free(rows);
+
+    if sq_close(db) != 0 { return 21; };
+    println!("plugin_sqlite ok");
+    return 0;
+}
