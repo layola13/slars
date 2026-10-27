@@ -409,3 +409,152 @@ Corpus: pass_match_expr_arms, run_match_expr (stdout-verified),
 fail_match_wildcard, fail_match_literal_pattern,
 fail_match_binding_pattern, fail_match_or_mismatch, fail_match_guard,
 fail_match_if_arm, fail_match_range_pattern.
+
+## §13. Phase 2 line 2: derive Clone/Default expansion + loop expression values (AG5)
+
+Status markers follow §6's convention. Everything in this section is
+implemented in the slars frontend transform layer (`src/slars_frontend.zig`);
+the shared SLA backend and sci were not modified. Corpus after this line:
+pass 12/12, fail 25/25, run 13/13, unit 3 (phase-1 baseline was
+12/14/8/3 — no regressions; the fail/run growth is this section's
+bidirectional corpus).
+
+### Derive expansion — mechanism
+
+`#[derive(Clone)]` / `#[derive(Default)]` on a type are expanded by the
+transform into an inherent `impl` block holding `fn clone(&self) -> Self`
+resp. `fn default() -> Self`, emitted right after the type declaration
+(enum Default uses a free helper instead — see the defect register below).
+The generated code is ordinary SLA and goes through the normal shared
+checker/lowering. A type that also has a manual `clone()`/`default()`
+while deriving the same trait is rejected (exactly one definition).
+`#[derive(...)]` lists mixing frontend-implemented traits with
+backend-mapped ones (Debug/Copy/PartialEq/…) still emit `@derive(...)`
+for the mapped remainder only.
+
+Field-form support, Clone (evidence: sala docs + sa_plugin_sla demos
+66_pair_sum / 69_serializer and tests/test_unit_impl_static_methods.sla
+for inherent-impl associated calls; sa_std inventory as cited per row):
+
+| field form | verdict | basis / generated code |
+|---|---|---|
+| integer / float / bool scalars | support (copy) | SLA values are copyable scalars |
+| char | support (copy); Default via `CHAR_FROM_U32_UNCHECKED(0)` | sa_std/char.sa macro surface |
+| String | support — `STRING_BUF_CLONE(place)` | sa_std/string.sa: STRING_BUF_CLONE expands to STRING_BUF_FROM_STR over the AS_STR view — a real allocate-and-copy deep clone (probe-verified) |
+| Vec<T> | support — element-wise rebuild via a generated per-type helper (`Vec::new()` + `for` + `push` of cloned elements) | sa_std vec.sa's `VEC_CLONE` macro is a byte copy (VEC_FROM_SLICE over the raw slice) — shallow for handle elements, so it is NOT used; the element-wise form is the honest deep clone |
+| Option<T> | support — generated helper with a match rebuilding Some/None | sa_std/core/option.sa surface |
+| nested struct (same file) that derives Clone or has manual clone() | support — `place.clone()` recursion | inherent impl associated calls as in the demos/tests above |
+| imported / unknown user type, generic parameter | support (passthrough) — emits `.clone()` / `U::default()`; the shared checker verifies the target loudly if it lacks the method | frontend cannot see the other module's table |
+| Arc<T> / Rc<T> | support — `place.clone()` (handle clone, the Rust semantics for these types) | evidence: sa_std/timer.sla clones an Arc field exactly this way |
+| tuple / array types (as a field, an element, at any nesting) | **REJECTED** (SLARS-DERIVE-UNSUPPORTED) | shared-backend defect D4 below: the backend corrupts such literal values before any clone runs. Default still supports them (the all-zero bit pattern reads identically under both layouts — run-proven) |
+| &T / &mut T, [T] slices, str, fn types | **REJECTED** | no clone surface in sa_std for these forms |
+| HashMap/HashSet/BTreeMap/BTreeSet/VecDeque/LinkedList/Box/Cell/RefCell/Mutex/RwLock | **REJECTED** | no clone surface adjudicated in sa_std for these forms (four-source check: sala docs, sla demos, sla tests, sa_std inventory) |
+| unit structs | **REJECTED** (Clone and Default) | the shared SLA surface has no unit-struct value form: the struct name is not an expression there (hand-written .sla probe: `return Token;` → UndefinedVariable) |
+
+Field-form support, Default: integers `0`, floats `0.0`, bool `false`,
+char as above, String `format("")` (probe: `String::new()` is an
+undefined call in the shared surface; `format!("")` is the working empty
+string), Vec<T> `Vec::new()`, Option<T> `Option::None`, arrays/tuples
+elementwise, nested Default struct `U::default()`, Arc/Rc **rejected**
+(no Default surface adjudicated), the reference/collection list above
+rejected identically to Clone. sa_std's `default.sa` DEFAULT_* macros
+exist at the SA level; the expansion deliberately uses SLA-level literal
+forms, which the corpus proves end-to-end.
+
+Enums:
+- `#[derive(Default)]` on an enum is SUPPORTED and requires exactly one
+  variant marked `#[default]` (payloads default recursively). Because of
+  defect D2 below, the expansion is a free function
+  `__slars_default_<E>() -> <E>` rather than an impl method, and
+  user-written `E::default()` call sites in the same file are rewritten
+  to it. Registered limitation: an enum declared in an *imported* .slars
+  file is not rewritten by the importing file's transform, so a
+  cross-module `E::default()` may hit defect D2 as a loud backend error.
+- `#[derive(Clone)]` on an enum is **REJECTED**, kept loud, with three
+  independent backend blockers proven by probes: (1) `match self` on
+  `&Self` fails the shared checker (TypeMismatch); (2) dereferencing a
+  borrowed enum compiles but segfaults at runtime in the shared lowering
+  (reproduced by a plain fn with no clone involved); (3) a by-value
+  `fn clone(self)` consumes the source — using it after `.clone()` fails
+  the build (SA referee UseAfterMove). The Copy escape hatch is also
+  unavailable: `@derive(...)` annotations do not attach to enum
+  declarations in the shared parser (probe: parse error at `enum`).
+  The rejection lifts when the backend can inspect a borrowed enum.
+
+Generic structs: the frontend passes generic-parameter fields through as
+`.clone()` / `U::default()` calls, but an end-to-end proof is currently
+impossible: struct literals of generic types fail in the shared checker
+("field access target `Wrap` is not a known struct") for hand-written
+code with a manual impl just as for derived code (probe evidence in the
+line report). Registered as backend gap D5; no corpus case claims it.
+
+### Shared-backend defects registered by this line (not fixed here)
+
+- **D1 — borrowed-enum dereference segfaults.** In pure SLA:
+  `fn f(e: &E) -> i32 { let o = *e; ... }` and `match *e` build cleanly
+  and segfault at runtime (rc 139), for unit and payload enums alike.
+- **D2 — an associated-call expression on an enum corrupts that enum's
+  literal resolution module-wide.** Once the checker has checked
+  `Mode::zero()` / `Mode::default()`, every `Mode::Variant` literal in
+  the module fails with `checkExpr failed at node tag enum_literal
+  (error.FieldNotFound)`. Probe matrix: literal in a free fn with no
+  associated call anywhere → pass; associated call present anywhere →
+  fail; routing all construction through a free fn with no associated
+  call → pass.
+- **D3 — `@derive(...)` does not attach to enum declarations** in the
+  shared parser (parse error "found 'enum', expected function, struct,
+  enum, … or annotation declaration" — the annotation path itself lists
+  enum yet rejects it after an annotation).
+- **D4 — tuple/array literal layout disagrees with typed accesses.**
+  Hand-written SLA, no slars involved: a struct with a tuple field and
+  an array field segfaults on plain construction + field reads; with
+  the field order swapped it returns wrong values (5 instead of 6).
+  The generated SA shows why: literal aggregates are constructed with
+  i64 slots (a `[i32; 3]` value occupies 24 bytes with stride 8; a
+  `(i32, bool)` value 9 bytes) while typed accesses use the declared
+  layout (stride 4; tuple size 5), and aggregate fields are stored as
+  pointers while field offsets reserve the declared inline sizes, so a
+  following field's pointer store overwrites the previous field's
+  pointer bytes.
+- **D5 — generic struct literals fail the shared checker** (NotAStruct),
+  for derived and hand-written code alike; phase-1 generic support
+  covers fns/traits, not struct literal construction.
+
+### Loop expression values
+
+Rust's `loop { ... break v; }` is supported in exactly three positions,
+lowered by the transform to the backend's statement forms (the shared
+grammar's `break` carries no value — `break 5;` is a parse error there):
+
+| position | lowering |
+|---|---|
+| `return loop { B }` | `{ while true { B' } panic(917776); }` with own-level `break v;` rewritten to `return v;` (full expression fidelity) |
+| `x = loop { B }` (assignment at statement position) | `while true { B' }` with `break v;` → `x = v; break;` — x keeps its previous value until a break assigns, exactly Rust's semantics |
+| `let x: T = loop { B }` | slot seeded with T's Default (same classification as derive(Default)), then as assignment; the type annotation is REQUIRED |
+
+Loud rejections (SLARS-LOOP-VALUE, at check time): a valued break in a
+statement-position loop; any valued break inside `while`/`for` (never
+legal Rust); a value loop in any other expression position (fn argument,
+struct-literal field, …); a nested value loop inside a value loop's
+body (statement loops with plain breaks nest freely — corpus-proven);
+a plain `break;` inside a value loop; a value loop that never breaks
+with a value; an unannotated `let` loop; a `let` loop whose type has no
+Default form. In slot positions the break expression is copied at token
+level (char/raw-string/lifetime conversions apply); macro calls inside
+slot-position break expressions are rejected (return position has no
+such restriction).
+
+Registered divergence (seed caveat): in the `let` lowering the binding
+exists — holding the seed — while the loop body runs, whereas Rust
+rejects reading the binding there. The seed is always a valid value of
+the declared type (its Default), never garbage; programs that read the
+binding inside its own loop body are outside Rust's accepted set and
+are not diagnosed.
+
+Corpus for this section: run_derive_clone_struct, run_derive_clone_tuple,
+run_derive_combo, run_derive_default, run_loop_value; fail_derive_clone,
+fail_derive_default, fail_derive_clone_enum, fail_derive_clone_map,
+fail_derive_default_enum, fail_derive_clone_tuple_field,
+fail_derive_clone_array_field, fail_derive_unit_struct,
+fail_loop_break_value_stmt, fail_loop_value_arg,
+fail_loop_let_no_annotation, fail_loop_plain_break, fail_loop_value_never.
