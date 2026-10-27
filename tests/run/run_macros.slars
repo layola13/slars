@@ -1,0 +1,11 @@
+fn main() -> i32 {
+    let a = 2;
+    let b = 3;
+    assert!(a > 0);
+    assert_eq!(a + b, 5);
+    assert_ne!(a, b);
+    let s = stringify!(hello);
+    let c = concat!("ab", "cd");
+    println!("{} {} {}", a + b, len(s), len(c));
+    return 0;
+}

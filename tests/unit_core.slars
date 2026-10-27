@@ -1,0 +1,22 @@
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+#[test]
+fn test_add() {
+    if add(1, 2) != 3 { panic(101); };
+}
+
+#[test]
+fn test_mut_binding() {
+    let mut x = 1;
+    x = x + 1;
+    if x != 2 { panic(102); };
+}
+
+#[test]
+fn test_shared_borrow() {
+    let v = 5;
+    let r = &v;
+    if *r != 5 { panic(103); };
+}

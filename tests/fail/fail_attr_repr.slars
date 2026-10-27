@@ -1,0 +1,9 @@
+// EXPECT: SLARS-ATTR-UNSUPPORTED
+#[repr(C)]
+struct Bag {
+    x: i32,
+}
+
+fn main() -> i32 {
+    return 0;
+}

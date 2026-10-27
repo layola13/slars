@@ -1,0 +1,27 @@
+fn sum_pair(a: &i32, b: &i32) -> i32 {
+    let x = *a;
+    let y = *b;
+    return x + y;
+}
+
+fn bump(x: &mut i32) {
+    let cur = *x;
+    *x = cur + 1;
+}
+
+fn main() -> i32 {
+    let v = 10;
+    let r1 = &v;
+    let r2 = &v;
+    let s = sum_pair(r1, r2);
+    let mut w = 1;
+    {
+        let m = &mut w;
+        bump(m);
+    }
+    {
+        let m2 = &mut w;
+        bump(m2);
+    }
+    return s + w;
+}

@@ -1,0 +1,17 @@
+enum Msg {
+    Quit,
+    Move(i32, i32),
+    Text(u64),
+}
+
+fn code(m: Msg) -> i32 {
+    return match m {
+        Msg::Quit => { 0 },
+        Msg::Move(x, y) => { x + y },
+        Msg::Text(n) => { n as i32 },
+    };
+}
+
+fn main() -> i32 {
+    return code(Msg::Move(2, 3)) + code(Msg::Quit);
+}

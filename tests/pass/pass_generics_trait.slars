@@ -1,0 +1,29 @@
+#[derive(Debug, Copy, PartialEq)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+trait Shape {
+    fn area(&self) -> i32;
+}
+
+struct Square {
+    size: i32,
+}
+
+impl Shape for Square {
+    fn area(&self) -> i32 {
+        return self.size * self.size;
+    }
+}
+
+fn first<T>(a: T, b: T) -> T {
+    return a;
+}
+
+fn main() -> i32 {
+    let sq = Square { size: 3 };
+    let p = Point { x: 1, y: 2 };
+    return sq.area() + first(1, 2) + p.x;
+}

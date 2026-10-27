@@ -1,0 +1,6 @@
+// EXPECT: SLARS-FMT-SPEC
+fn main() -> i32 {
+    let x = 3;
+    println!("{:.2}", x);
+    return 0;
+}

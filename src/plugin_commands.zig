@@ -15,6 +15,7 @@ const host_paths = @import("host_paths.zig");
 const plugin_import_expand = @import("plugin_import_expand.zig");
 const plugin_module_table = @import("plugin_module_table.zig");
 const plugin_compile = @import("plugin_compile.zig");
+const slars_frontend = @import("slars_frontend.zig");
 const plugin_compile_options = @import("plugin_compile_options.zig");
 
 const ResolvedImport = plugin_imports.ResolvedImport;
@@ -472,6 +473,15 @@ pub fn runSlaCommandImpl(
         };
         plugin_compile_options.slaProfileStage(stderr, profile, "check read source", stage_start);
 
+        // [slars] The check command runs its own inline frontend pipeline
+        // (it does not go through plugin_compile.runSlaFrontend), so the
+        // root-file gate is applied here as well.
+        if (std.mem.endsWith(u8, file, ".slars") and !slarsStrictDisabledHere(allocator)) {
+            if (!slars_frontend.checkSource(allocator, content, file, stderr)) {
+                return 1;
+            }
+        }
+
         stage_start = sio.nanoTimestamp();
         const expanded_content = source_expand.expandForModulePath(allocator, file, content) catch |err| {
             try stderr.print("Macro Expansion Error: failed to expand tuple templates in {s}: {}\n", .{ file, err });
@@ -614,4 +624,10 @@ pub fn runSlaCommandImpl(
         try stderr.print("Unknown sla command: {s}\n", .{cmd});
         return 1;
     }
+}
+
+fn slarsStrictDisabledHere(allocator: std.mem.Allocator) bool {
+    const value = sio.getEnvVarOwned(allocator, "SLARS_DISABLE_STRICT") catch return false;
+    defer allocator.free(value);
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
 }

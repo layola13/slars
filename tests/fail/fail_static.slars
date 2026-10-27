@@ -1,0 +1,6 @@
+// EXPECT: SLARS-STATIC
+static COUNTER: i32 = 5;
+
+fn main() -> i32 {
+    return COUNTER;
+}

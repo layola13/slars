@@ -1,0 +1,11 @@
+fn main() -> i32 {
+    let v = vec![10, 20, 30];
+    let mut total = 0;
+    for i in 0..3 {
+        total = total + v[i];
+    }
+    let mut w: Vec<i32> = Vec::new();
+    w.push(total);
+    println!("{} {}", total, len(w));
+    return 0;
+}

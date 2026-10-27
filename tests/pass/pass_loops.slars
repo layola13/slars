@@ -1,0 +1,18 @@
+fn main() -> i32 {
+    let mut total = 0;
+    let mut n = 0;
+    loop {
+        n = n + 1;
+        if n > 4 { break; };
+        total = total + n;
+    }
+    for i in 0..=3 {
+        total = total + i;
+    }
+    let mut k = 0;
+    while k < 2 {
+        k = k + 1;
+        total = total + 100;
+    }
+    return total;
+}

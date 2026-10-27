@@ -1,0 +1,15 @@
+fn bump(x: &mut i32) {
+    let cur = *x;
+    *x = cur + 1;
+}
+
+fn main() -> i32 {
+    let mut w = 41;
+    {
+        let m = &mut w;
+        bump(m);
+    }
+    let r = &w;
+    println!("{}", *r);
+    return 0;
+}

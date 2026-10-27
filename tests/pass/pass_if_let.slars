@@ -1,0 +1,14 @@
+@import "sa_std/core/option.sa"
+
+fn main() -> i32 {
+    let a: Option<i32> = Option::Some(7);
+    let mut total = 0;
+    if let Some(v) = a {
+        total = v;
+    };
+    let b: Option<i32> = Option::None;
+    if let Some(w) = b {
+        total = total + w;
+    };
+    return total;
+}

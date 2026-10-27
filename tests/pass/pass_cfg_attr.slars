@@ -1,0 +1,18 @@
+#[cfg(target_os = "linux")]
+fn platform() -> i32 {
+    return 1;
+}
+
+#[cfg(target_os = "windows")]
+fn platform() -> i32 {
+    return 2;
+}
+
+#[inline]
+fn helper() -> i32 {
+    return 5;
+}
+
+fn main() -> i32 {
+    return platform() + helper();
+}

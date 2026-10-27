@@ -1,0 +1,5 @@
+// EXPECT: SLARS-MACRO-UNKNOWN
+fn main() -> i32 {
+    frobnicate!(1);
+    return 0;
+}

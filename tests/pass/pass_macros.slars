@@ -1,0 +1,23 @@
+fn check_vals(a: i32, b: i32) -> i32 {
+    assert!(a > 0);
+    assert_eq!(a + b, 5);
+    assert_ne!(a, b, "a and b differ");
+    return a;
+}
+
+fn names() -> i32 {
+    let s = stringify!(hello_world);
+    let c = concat!("ab", "cd");
+    if cfg!(target_os = "linux") {
+        return check_vals(2, 3) + len(s) + len(c);
+    };
+    return 0;
+}
+
+fn later() -> i32 {
+    todo!();
+}
+
+fn main() -> i32 {
+    return names();
+}

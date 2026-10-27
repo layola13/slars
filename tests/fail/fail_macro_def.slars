@@ -1,0 +1,10 @@
+// EXPECT: SLARS-MACRO-DEF
+macro_rules! my_macro {
+    () => {
+        1
+    };
+}
+
+fn main() -> i32 {
+    return 0;
+}

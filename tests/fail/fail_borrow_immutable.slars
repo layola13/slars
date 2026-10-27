@@ -1,0 +1,6 @@
+// EXPECT: SLARS-BORROW-IMMUTABLE
+fn main() -> i32 {
+    let x = 1;
+    let m = &mut x;
+    return *m;
+}

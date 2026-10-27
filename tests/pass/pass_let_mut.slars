@@ -1,0 +1,11 @@
+fn compute() -> i32 {
+    let mut total = 0;
+    total = total + 5;
+    total += 3;
+    total = total + 1;
+    return total;
+}
+
+fn main() -> i32 {
+    return compute();
+}

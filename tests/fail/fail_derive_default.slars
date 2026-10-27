@@ -1,0 +1,9 @@
+// EXPECT: SLARS-DERIVE-UNSUPPORTED
+#[derive(Default)]
+struct Bag {
+    x: i32,
+}
+
+fn main() -> i32 {
+    return 0;
+}

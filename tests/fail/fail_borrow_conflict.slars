@@ -1,0 +1,7 @@
+// EXPECT: SLARS-BORROW-CONFLICT
+fn main() -> i32 {
+    let mut x = 1;
+    let a = &x;
+    let b = &mut x;
+    return *a + *b;
+}

@@ -1,0 +1,9 @@
+async fn fetch_value() -> i32 {
+    return 21;
+}
+
+fn main() -> i32 {
+    let add = |x: i32| x + 1;
+    let v = add(20);
+    return v;
+}

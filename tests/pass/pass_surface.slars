@@ -1,0 +1,13 @@
+fn greet(name: ptr) -> i32 {
+    return len(name);
+}
+
+fn main() -> i32 {
+    let c = 'a';
+    let mut total = greet("hi");
+    unsafe {
+        total = total + 1;
+    }
+    let big: u64 = 5u64;
+    return total + (c as i32) + (big as i32);
+}

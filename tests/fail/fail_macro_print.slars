@@ -1,0 +1,5 @@
+// EXPECT: SLARS-MACRO-REJECTED
+fn main() -> i32 {
+    print!("hi");
+    return 0;
+}

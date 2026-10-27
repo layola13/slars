@@ -527,6 +527,7 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
     var needs_macro_import = false;
     var in_for_header = false;
     var range_plus_pending = false;
+    var unsafe_semi_at: ?usize = null;
 
     const emit = struct {
         fn seg(out2: *std.array_list.Managed(u8), segs2: *std.array_list.Managed([]const u8), source2: []const u8, t: Tok, replacement: ?[]const u8) !void {
@@ -579,7 +580,13 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                 out.appendSlice(")") catch {};
                 segs.append("@derive") catch {};
             } else if (std.mem.eql(u8, attr_name, "cfg")) {
-                const keep = evalCfg(toks, source, inner_lo + 1, close, true);
+                var cfg_lo = inner_lo + 1;
+                var cfg_hi = close;
+                if (cfg_lo < close and textEq(source, toks[cfg_lo], "(")) {
+                    cfg_hi = findMatch(toks, source, cfg_lo, "(", ")") orelse close;
+                    cfg_lo += 1;
+                }
+                const keep = evalCfg(toks, source, cfg_lo, cfg_hi, true);
                 segs.append("") catch {};
                 if (!keep) {
                     // Drop the following item as well.
@@ -750,6 +757,7 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                     const close = findMatch(toks, source, open, "(", ")") orelse open;
                     const args = splitArgs(allocator, toks, source, open, close) catch &.{};
                     appendPrefixNorm(&out, source, t.pre_start, t.start) catch {};
+                    var emitted_block = false;
                     switch (act) {
                         .assert_macro => {
                             if (args.len == 1) {
@@ -772,6 +780,7 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                                     out.appendSlice(atext) catch {};
                                 }
                                 out.appendSlice("); panic(917003); }; }") catch {};
+                                emitted_block = true;
                             } else {
                                 out.appendSlice("SLARS_ASSERT(true)") catch {};
                                 needs_macro_import = true;
@@ -804,6 +813,7 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                                     out.appendSlice(b) catch {};
                                 }
                                 out.appendSlice(if (is_eq) "); panic(917004); }; }" else "); panic(917005); }; }") catch {};
+                                emitted_block = true;
                             }
                             segs.append("assert_cmp") catch {};
                         },
@@ -868,6 +878,7 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                             out.appendSlice(": not implemented\"); panic(") catch {};
                             out.appendSlice(if (std.mem.eql(u8, s, "todo")) "917090" else "917091") catch {};
                             out.appendSlice("); }") catch {};
+                            emitted_block = true;
                             segs.append("todo") catch {};
                         },
                         else => {
@@ -876,6 +887,9 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
                         },
                     }
                     i = close + 1;
+                    // A block-form macro expansion is a complete statement:
+                    // swallow the source statement's terminating ';'.
+                    if (emitted_block and i < toks.len and textEq(source, toks[i], ";")) i += 1;
                     continue;
                 }
             }
@@ -894,7 +908,23 @@ pub fn transformSource(allocator: std.mem.Allocator, source: []const u8) []const
         }
         if (t.kind == .punct and std.mem.eql(u8, s, "{")) in_for_header = false;
 
+        // ---- unsafe block in statement position: SLA wants a ';' after
+        // the closing brace; Rust does not write one.
+        if (t.kind == .ident and std.mem.eql(u8, s, "unsafe") and next_idx != null and textEq(source, toks[next_idx.?], "{")) {
+            const prev_text: []const u8 = if (segs.items.len > 0) segs.items[segs.items.len - 1] else "";
+            if (prev_text.len == 0 or std.mem.eql(u8, prev_text, ";") or std.mem.eql(u8, prev_text, "{") or std.mem.eql(u8, prev_text, "}")) {
+                unsafe_semi_at = findMatch(toks, source, next_idx.?, "{", "}");
+            }
+        }
+
         emit.seg(&out, &segs, source, t, null) catch {};
+        if (unsafe_semi_at != null and unsafe_semi_at.? == i) {
+            unsafe_semi_at = null;
+            if (i + 1 >= toks.len or !textEq(source, toks[i + 1], ";")) {
+                out.appendSlice(";") catch {};
+                segs.append(";") catch {};
+            }
+        }
         i += 1;
     }
 
@@ -1266,7 +1296,10 @@ fn strictCheck(allocator: std.mem.Allocator, toks: []const Tok, source: []const 
                 }
                 if (walked and j < toks.len and isAssignOp(tokText(source, toks[j]))) {
                     if (lookupBinding(&frames, s)) |b| {
-                        if (!b.is_mut) {
+                        // Field/index assignment mutates through the binding:
+                        // allowed for `let mut` bindings and for bindings
+                        // holding a &mut (pointee mutability), as in Rust.
+                        if (!b.is_mut and !b.pointee_mut) {
                             return failDiagFmt(allocator, stderr, file, t.line, "SLARS-IMMUTABLE-ASSIGN", "cannot assign through immutable binding '{s}' (declare it with 'let mut')", .{s});
                         }
                     }

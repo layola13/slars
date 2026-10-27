@@ -1,0 +1,7 @@
+struct Pair(i32, i32);
+
+fn main() -> i32 {
+    let p = Pair(3, 4);
+    let arr = [1, 2, 3];
+    return p.0 + p.1 + arr[0] + arr[2];
+}
