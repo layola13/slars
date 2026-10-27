@@ -1,0 +1,15 @@
+// EXPECT: SLARS-MATCH-PATTERN
+enum Msg {
+    Quit,
+    Move(i32, i32),
+    Text(i32),
+}
+
+fn f(m: Msg) -> i32 {
+    return match m {
+        Msg::Move(x, y) | Msg::Text(t) => 0,
+        Msg::Quit => 1,
+    };
+}
+
+fn main() -> i32 { return f(Msg::Quit); }

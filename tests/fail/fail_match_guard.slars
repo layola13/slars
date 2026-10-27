@@ -1,0 +1,15 @@
+// EXPECT: SLARS-MATCH-GUARD
+enum Msg {
+    Quit,
+    Move(i32, i32),
+}
+
+fn f(m: Msg) -> i32 {
+    return match m {
+        Msg::Quit => 0,
+        Msg::Move(x, y) if x > 0 => 1,
+        Msg::Move(x, y) => 2,
+    };
+}
+
+fn main() -> i32 { return f(Msg::Quit); }

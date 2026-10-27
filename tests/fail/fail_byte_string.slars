@@ -1,0 +1,5 @@
+// EXPECT: SLARS-BYTE-STRING
+fn main() -> i32 {
+    let s = b"abc";
+    return 0;
+}

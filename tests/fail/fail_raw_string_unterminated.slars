@@ -1,0 +1,5 @@
+// EXPECT: SLARS-RAW-STRING
+fn main() -> i32 {
+    let s = r#"this raw string never terminates;
+    return 0;
+}

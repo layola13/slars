@@ -1,0 +1,14 @@
+// EXPECT: SLARS-MATCH-ARM
+enum Msg {
+    Quit,
+    Move(i32, i32),
+}
+
+fn f(m: Msg, c: bool) -> i32 {
+    return match m {
+        Msg::Quit => if c { 1 } else { 2 },
+        Msg::Move(x, y) => x + y,
+    };
+}
+
+fn main() -> i32 { return f(Msg::Quit, true); }

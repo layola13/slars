@@ -1,0 +1,43 @@
+enum Msg {
+    Quit,
+    Move(i32, i32),
+    Text(i32),
+}
+
+fn code(m: Msg) -> i32 {
+    let v = match m {
+        Msg::Quit => 0,
+        Msg::Move(x, y) => x * 10 + y,
+        Msg::Text(t) => t * 3,
+    };
+    return v + 1;
+}
+
+fn pick(m: Msg) -> i32 {
+    return match m {
+        Msg::Quit | Msg::Text(_) => 100,
+        Msg::Move(x, _) => x,
+    } * 2;
+}
+
+fn nested(m: Msg, o: Msg) -> i32 {
+    return match m {
+        Msg::Quit => 0,
+        Msg::Move(a, b) => a - b,
+        Msg::Text(t) => match o {
+            Msg::Quit => t,
+            Msg::Move(a, b) => t + a + b,
+            Msg::Text(u) => t + u,
+        },
+    };
+}
+
+fn main() -> i32 {
+    println!("{}", code(Msg::Move(2, 3)));
+    println!("{}", code(Msg::Quit));
+    println!("{}", pick(Msg::Text(7)));
+    println!("{}", pick(Msg::Move(5, 9)));
+    println!("{}", nested(Msg::Text(7), Msg::Move(1, 2)));
+    println!("{}", nested(Msg::Move(9, 4), Msg::Quit));
+    return 0;
+}

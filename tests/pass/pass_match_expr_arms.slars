@@ -1,0 +1,69 @@
+enum Msg {
+    Quit,
+    Move(i32, i32),
+    Text(i32),
+}
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn code(m: Msg) -> i32 {
+    let a = match m {
+        Msg::Quit => 0,
+        Msg::Move(x, y) => x * 10 + y,
+        Msg::Text(t) => t,
+    };
+    return a + 1;
+}
+
+fn pick(m: Msg) -> i32 {
+    return match m {
+        Msg::Quit => 0,
+        Msg::Move(x, _) | Msg::Text(x) => x * 2,
+    };
+}
+
+fn make(m: Msg) -> Point {
+    return match m {
+        Msg::Quit => Point { x: 0, y: 0 },
+        Msg::Move(x, y) => Point { x: x, y: y },
+        Msg::Text(t) => Point { x: t, y: t },
+    };
+}
+
+fn nested(m: Msg, o: Msg) -> i32 {
+    return match m {
+        Msg::Quit => 0,
+        Msg::Move(a, b) => a + b,
+        Msg::Text(t) => match o {
+            Msg::Quit => t,
+            Msg::Move(a, b) => t + a + b,
+            Msg::Text(u) => t + u,
+        },
+    };
+}
+
+fn bump(m: Msg) -> i32 {
+    let mut total = 0;
+    match m {
+        Msg::Quit => total = 1,
+        Msg::Move(a, b) => total = a + b,
+        Msg::Text(t) => total = t,
+    };
+    return total;
+}
+
+fn weighted(m: Msg) -> i32 {
+    return 1 + match m {
+        Msg::Quit => 0,
+        Msg::Move(x, y) => x + y,
+        Msg::Text(t) => t,
+    };
+}
+
+fn main() -> i32 {
+    let p = make(Msg::Move(1, 2));
+    return code(Msg::Text(3)) + pick(Msg::Text(4)) + nested(Msg::Text(1), Msg::Quit) + bump(Msg::Move(2, 3)) + weighted(Msg::Quit) + p.x + p.y;
+}

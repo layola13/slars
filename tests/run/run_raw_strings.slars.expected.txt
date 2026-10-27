@@ -1,0 +1,6 @@
+C:\new\path
+say "hi" ok
+a "# b
+one
+two
+a\nb

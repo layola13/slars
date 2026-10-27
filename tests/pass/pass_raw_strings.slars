@@ -1,0 +1,13 @@
+fn measure(name: ptr) -> i32 {
+    return len(name);
+}
+
+fn main() -> i32 {
+    let mut total = measure(r"C:\temp\new");
+    total = total + measure(r#"with "quotes" inside"#);
+    total = total + measure(r##"hash ## and "quote" mix"##);
+    total = total + measure(r"multi
+line raw");
+    total = total + measure(r"arg \# position");
+    return total;
+}

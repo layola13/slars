@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    println!("{}", r"C:\new\path");
+    println!("{}", r#"say "hi" ok"#);
+    println!("{}", r##"a "# b"##);
+    println!("{}", r"one
+two");
+    println!("{}", r"a\nb");
+    return 0;
+}

@@ -1,0 +1,8 @@
+// EXPECT: SLARS-MATCH-PATTERN
+fn f(x: i32) -> i32 {
+    return match x {
+        n => n,
+    };
+}
+
+fn main() -> i32 { return f(1); }
